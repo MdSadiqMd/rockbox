@@ -1,9 +1,9 @@
 //! Internally-tagged enum (`cmd` discriminator) so Elixir Msgpax `%{"cmd" =>
 //! "execute", ...}` maps directly without an outer wrapper.
 
+pub use crate::settings::FileEntry;
 use crate::settings::Settings;
 use serde::{Deserialize, Serialize};
-pub use crate::settings::FileEntry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
