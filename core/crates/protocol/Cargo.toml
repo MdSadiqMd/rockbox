@@ -11,7 +11,11 @@ description = "Wire protocol types shared between Elixir orchestrator and Rust e
 workspace = true
 
 [dependencies]
+serde       = { workspace = true }
+serde_bytes = { workspace = true }
+rmp-serde   = { workspace = true }
 thiserror   = { workspace = true }
+uuid        = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
