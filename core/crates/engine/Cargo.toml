@@ -1,0 +1,17 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Per-VM Rust execution engine. Reads msgpack Port commands from stdin, drives the 10-layer sandbox, streams output back."
+
+[[bin]]
+name = "engine"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
