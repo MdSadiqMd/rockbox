@@ -98,3 +98,31 @@ fn io_err(e: std::io::Error) -> ProtocolError {
     // supervisor decides whether to respawn.
     ProtocolError::Decode(rmp_serde::decode::Error::Uncategorized(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+    use tokio::io::duplex;
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Sample {
+        kind: String,
+        n: u32,
+    }
+
+    #[tokio::test]
+    async fn roundtrip_frame() {
+        let (a, b) = duplex(1024);
+        let writer = FrameWriter::new(a);
+        let mut reader = FrameReader::new(b);
+
+        let msg = Sample {
+            kind: "ping".into(),
+            n: 42,
+        };
+        writer.write(&msg).await.unwrap();
+        let got: Sample = reader.read().await.unwrap();
+        assert_eq!(got, msg);
+    }
+}
