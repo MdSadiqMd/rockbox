@@ -42,6 +42,9 @@ pub struct Settings {
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 
+    pub network: NetworkSettings,
+    pub filesystem: FilesystemSettings,
+
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 
@@ -52,6 +55,18 @@ pub struct Settings {
 
     #[serde(default)]
     pub stdin: Option<StdinPayload>,
+
+    #[serde(default)]
+    pub determinism: Determinism,
+
+    #[serde(default)]
+    pub gpu: GpuSettings,
+
+    pub output: OutputSettings,
+    pub observability: ObservabilitySettings,
+
+    #[serde(default)]
+    pub cost: CostSettings,
 }
 
 fn default_schema() -> String {
@@ -183,4 +198,177 @@ pub enum LifecyclePolicy {
     OnOom,
     OnCrash,
     Always,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSettings {
+    pub tier: NetworkTier,
+    #[serde(default)]
+    pub allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    pub bandwidth_mbps: Option<u32>,
+    #[serde(default)]
+    pub max_conns: Option<u32>,
+    /// Always true, caller cannot disable. Field exists so the wire format
+    /// is explicit about the guarantee.
+    pub block_metadata: bool,
+    pub dns: DnsSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkTier {
+    None,
+    Loopback,
+    EgressAllowlist,
+    EgressOpen,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DnsSettings {
+    pub mode: DnsMode,
+    pub cache_s: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    Proxied,
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemSettings {
+    #[serde(default)]
+    pub writable_paths: Vec<String>,
+    #[serde(default)]
+    pub mounts: Vec<ExtraMount>,
+    #[serde(default)]
+    pub preserve_on_exit: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtraMount {
+    /// Source URI: `session:<uuid>`, `episode:<uuid>`, `volume:<id>`.
+    pub source: String,
+    pub target: String,
+    pub mode: MountMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MountMode {
+    Ro,
+    Rw,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Determinism {
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub deterministic_time: bool,
+    #[serde(default)]
+    pub freeze_random: bool,
+    #[serde(default)]
+    pub pin_runtime_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GpuSettings {
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    #[serde(default)]
+    pub mig: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSettings {
+    pub stream: bool,
+    pub binary_safe: bool,
+    pub merge_streams: bool,
+    pub include_metrics: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    pub capture_metrics: bool,
+    #[serde(default)]
+    pub trace_syscalls: bool,
+    #[serde(default)]
+    pub webhook: Option<WebhookSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSettings {
+    pub url: String,
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// HMAC key already resolved by SecretsBroker.
+    #[serde(default)]
+    pub hmac_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CostSettings {
+    #[serde(default)]
+    pub max_credits: Option<u64>,
+    /// 0.0..=1.0 fraction of `max_credits` at which to alert.
+    #[serde(default)]
+    pub alert_at: Option<f32>,
+}
+
+impl Settings {
+    /// Cheap structural validation. Heavier cross-field checks happen in the
+    /// Elixir SettingsValidator before the engine ever sees this; this is the
+    /// last-line defense if the Port channel is tampered with.
+    pub fn validate(&self) -> Result<(), crate::ProtocolError> {
+        use crate::ProtocolError as E;
+        if self.schema != crate::SCHEMA_VERSION {
+            return Err(E::UnsupportedSchema {
+                version: self.schema.clone(),
+                expected: crate::SCHEMA_VERSION,
+            });
+        }
+        if self.request_id.is_empty() {
+            return Err(E::InvalidRequestId("empty".into()));
+        }
+        if self.files.is_empty() {
+            return Err(E::InvariantViolation("files[] is empty".into()));
+        }
+        if self.limits.memory_mb == 0 {
+            return Err(E::InvariantViolation("memory_mb=0".into()));
+        }
+        if matches!(self.mode, Mode::Session) && self.session_id.is_none() {
+            return Err(E::InvariantViolation(
+                "mode=session needs session_id".into(),
+            ));
+        }
+        if self.network.tier == NetworkTier::None
+            && self.capabilities.contains(&Capability::Install)
+        {
+            return Err(E::InvariantViolation(
+                "+install requires network>=allowlist".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn has_capability(&self, cap: Capability) -> bool {
+        self.capabilities.contains(&cap)
+    }
 }
