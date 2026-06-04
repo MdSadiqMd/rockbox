@@ -4,6 +4,7 @@
 //! `docs/nix_sandbox_flowchart.md`:
 //!
 //! - [`clone3`] — fused clone + pidfd + cgroup placement (PERF-06 + SEC-17)
+//! - [`userns`] — uid_map + setgroups deny + sync pipe (SEC-02)
 //! - [`apparmor`] — `change_onexec` to per-uuid profile (SEC-09 + SEC-25)
 //! - [`cgroup`] — v2 + `cgroup.kill` (PERF-10)
 //! - [`drain`] — io_uring stdout/stderr/pidfd/timer (PERF-08)
@@ -16,6 +17,7 @@ pub mod cgroup;
 pub mod clone3;
 pub mod drain;
 pub mod pidfd;
+pub mod userns;
 
 pub use cgroup::{Cgroup, CgroupConfig};
 pub use drain::Drainer;
