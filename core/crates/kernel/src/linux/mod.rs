@@ -5,6 +5,7 @@
 //!
 //! - [`clone3`] — fused clone + pidfd + cgroup placement (PERF-06 + SEC-17)
 //! - [`userns`] — uid_map + setgroups deny + sync pipe (SEC-02)
+//! - [`mounts`] — pivot_root + tmpfs + bind mounts (SEC-10 + PERF-11)
 //! - [`apparmor`] — `change_onexec` to per-uuid profile (SEC-09 + SEC-25)
 //! - [`cgroup`] — v2 + `cgroup.kill` (PERF-10)
 //! - [`drain`] — io_uring stdout/stderr/pidfd/timer (PERF-08)
@@ -18,9 +19,11 @@ pub mod cgroup;
 pub mod clone3;
 pub mod drain;
 pub mod launcher;
+pub mod mounts;
 pub mod pidfd;
 pub mod userns;
 
 pub use cgroup::{Cgroup, CgroupConfig};
 pub use drain::Drainer;
 pub use launcher::{ChildExit, ChildHandle, SandboxLauncher};
+pub use mounts::MountPlan;
