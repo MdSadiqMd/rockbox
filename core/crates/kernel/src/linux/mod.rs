@@ -17,6 +17,7 @@
 //! Most modules are stand-alone testable; integration happens in [`launcher`].
 
 pub mod apparmor;
+pub mod caps;
 pub mod cgroup;
 pub mod clone3;
 pub mod drain;
@@ -27,6 +28,7 @@ pub mod seccomp;
 pub mod userns;
 
 pub use apparmor::{change_onexec, is_available as apparmor_is_available};
+pub use caps::{apply_rlimits, drop_all_capabilities, enable_mdwe, set_no_new_privs};
 pub use cgroup::{Cgroup, CgroupConfig, CGROUP_ROOT};
 pub use clone3::{clone3, CloneRequest, Cloned};
 pub use drain::{ChildExit, Drainer};
