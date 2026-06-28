@@ -29,14 +29,14 @@ pub mod userns;
 
 pub use apparmor::{change_onexec, is_available as apparmor_is_available};
 pub use caps::{apply_rlimits, drop_all_capabilities, enable_mdwe, set_no_new_privs};
-pub use cgroup::{Cgroup, CgroupConfig, CGROUP_ROOT};
-pub use clone3::{clone3, CloneRequest, Cloned};
+pub use cgroup::{CGROUP_ROOT, Cgroup, CgroupConfig};
+pub use clone3::{CloneRequest, Cloned, clone3};
 pub use drain::{ChildExit, Drainer};
 pub use launcher::{ChildHandle, SandboxLauncher};
 pub use mounts::MountPlan;
 pub use pidfd::{open as pidfd_open, send_signal as pidfd_send_signal};
 pub use seccomp::{BpfProfile, SeccompResolver};
 pub use userns::{
-    child_wait_for_release, make_sync_pipe, release_child, write_id_maps, SyncPipe, NOBODY_GID,
-    NOBODY_UID,
+    NOBODY_GID, NOBODY_UID, SyncPipe, child_wait_for_release, make_sync_pipe, release_child,
+    write_id_maps,
 };
