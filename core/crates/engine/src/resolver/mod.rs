@@ -8,7 +8,9 @@
 //! - [`mount`] — build `Vec<MountKind>` from `filesystem.*` + mode
 //! - [`limits`] — translate `Limits` → `ResourceLimits` (handles large_fs cap)
 //! - [`seccomp`] — choose profile id from language + capabilities
+//! - [`apparmor`] — pick profile name; parameterise per-uuid
 
+pub mod apparmor;
 pub mod env;
 pub mod limits;
 pub mod mount;
