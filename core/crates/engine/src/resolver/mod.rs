@@ -9,9 +9,11 @@
 //! - [`limits`] — translate `Limits` → `ResourceLimits` (handles large_fs cap)
 //! - [`seccomp`] — choose profile id from language + capabilities
 //! - [`apparmor`] — pick profile name; parameterise per-uuid
+//! - [`spec`] — top-level assembly returning [`kernel::ChildSpec`]
 
 pub mod apparmor;
 pub mod env;
 pub mod limits;
 pub mod mount;
 pub mod seccomp;
+pub mod spec;
