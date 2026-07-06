@@ -95,7 +95,7 @@ pub enum StdinPayload {
     Bytes(#[serde(with = "serde_bytes")] Vec<u8>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Language {
     Python,

@@ -12,6 +12,7 @@ use anyhow::Result;
 use cache::{BinaryCache, EnvCache};
 use kernel::SandboxLauncher;
 use parking_lot::Mutex;
+use protocol::Language;
 use std::sync::Arc;
 
 pub struct EngineState {
@@ -20,6 +21,23 @@ pub struct EngineState {
     /// `None` on non-Linux dev hosts; mode handlers must gracefully refuse.
     pub launcher: Option<Arc<SandboxLauncher>>,
     pub current: Mutex<Option<RequestState>>,
+    /// Last active language (set by every `Execute`). LSP relay reads it to
+    /// pick the language server binary. Persisted across requests so
+    /// `mode=session` + `lsp` interleave cleanly.
+    pub active_language: Mutex<Option<Language>>,
+    /// Session state, keyed by session id. Each entry is the frozen Settings
+    /// from the initiating `Execute` — cell runs clone from it and override
+    /// entrypoint/files. Persistent namespace lives on disk at
+    /// `/var/lib/sandbox/sessions/<uuid>/` (bind-mounted RW into the sandbox
+    /// as `/session`) so state survives across per-cell sandbox spawns.
+    pub sessions: Mutex<std::collections::HashMap<String, protocol::Settings>>,
+    /// RL episode state, keyed by episode id. Same pattern as `sessions`
+    /// but the persistent bind is `/episode` and the shim implements
+    /// reset+step semantics against a user env module.
+    pub episodes: Mutex<std::collections::HashMap<String, protocol::Settings>>,
+    /// LSP language-server child pool, keyed by language. Servers are
+    /// long-lived and reused across relay() calls; killed on engine shutdown.
+    pub lsp_servers: Mutex<std::collections::HashMap<Language, Arc<crate::modes::lsp::LspServer>>>,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -49,7 +67,19 @@ impl EngineState {
             binary_cache: BinaryCache::new("/var/cache/sandbox/bin"),
             launcher: SandboxLauncher::new().ok().map(Arc::new),
             current: Mutex::new(None),
+            active_language: Mutex::new(None),
+            sessions: Mutex::new(std::collections::HashMap::new()),
+            episodes: Mutex::new(std::collections::HashMap::new()),
+            lsp_servers: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    pub fn set_language(&self, lang: Language) {
+        *self.active_language.lock() = Some(lang);
+    }
+
+    pub fn language(&self) -> Option<Language> {
+        *self.active_language.lock()
     }
 
     pub async fn send_stdin(&self, bytes: &[u8]) -> Result<()> {
