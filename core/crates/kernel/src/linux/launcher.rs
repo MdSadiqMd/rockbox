@@ -186,8 +186,9 @@ fn run_child(
         let _ = caps::enable_mdwe();
     }
 
-    // 5. Seccomp (Layer 3 in §6).
-    seccomp::SeccompResolver::new().apply(bpf)?;
+    // 5. Seccomp (Layer 3 in §6). Stateless apply — the BPF blob was compiled
+    // once at engine boot and is now just being reloaded into this task.
+    seccomp::SeccompResolver::apply(bpf)?;
 
     // 6. Drop caps + rlimits (Layers 5 & 6).
     caps::drop_all_capabilities()?;
