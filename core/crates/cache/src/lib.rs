@@ -1,14 +1,9 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Caches owned by the engine process:
+//!
+//! - **T1 env cache** ([`env_cache`]): pre-warmed Nix env-var sets keyed by
+//!   `sha256(flake.lock + lang + arch + glibc_ver)`. Top-N kept in mmap'd
+//!   memfd (PERF-09) on Linux; on darwin we fall back to plain process memory.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod env_cache;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use env_cache::{EnvCache, EnvKey, EnvSnapshot};
