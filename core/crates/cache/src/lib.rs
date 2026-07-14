@@ -5,5 +5,7 @@
 //!   memfd (PERF-09) on Linux; on darwin we fall back to plain process memory.
 
 pub mod env_cache;
+pub mod hash;
 
 pub use env_cache::{EnvCache, EnvKey, EnvSnapshot};
+pub use hash::{Sha256Digest, sha256_hex};
