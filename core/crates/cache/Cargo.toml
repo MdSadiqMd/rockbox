@@ -5,9 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
-
-[dependencies]
+description = "Env cache (memfd top-N) + binary cache (sha256 verified-fd)"
 
 [lints]
 workspace = true
+
+[dependencies]
+protocol    = { workspace = true }
+serde       = { workspace = true }
+rmp-serde   = { workspace = true }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+sha2        = { workspace = true }
+hex         = { workspace = true }
+dashmap     = { workspace = true }
+parking_lot = { workspace = true }
+once_cell   = { workspace = true }
+memmap2     = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+nix  = { workspace = true }
