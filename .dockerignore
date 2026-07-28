@@ -1,0 +1,19 @@
+# Build outputs
+_build/
+deps/
+core/target/
+
+# Editor / OS noise
+.git/
+.gitignore
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs / runtime
+*.log
+/tmp/
+priv/static/
+
+# Docs are still copied (so help text inside container works)

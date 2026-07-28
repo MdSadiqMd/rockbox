@@ -1,0 +1,97 @@
+# Single image, used by all three compose services (`postgres`, `engine-watch`,
+# `app`). Carries the whole toolchain: Elixir 1.18 / OTP 27, Rust 1.85
+# (edition 2024), `cargo-watch`, `just`, `bubblewrap`, and `nixfmt` so every
+# `just` recipe defined in the root Justfile works inside the container
+#
+# Source is bind-mounted from the host at runtime, so any code change picks
+# up automatically: Phoenix reloads `.ex/.exs`, `cargo-watch` rebuilds Rust
+#
+# Build:   docker compose build           (or `just docker-up`)
+# Run:     docker compose up -d           (the compose file picks the service)
+# Shell:   docker compose exec app bash   (or `just docker-shell`)
+#
+# Production deploys should use a smaller multi-stage image this one keeps
+# every tool on PATH so the same Justfile recipes work in CI, dev, and host
+
+FROM elixir:1.18-otp-27-slim AS dev
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    MIX_HOME=/root/.mix \
+    HEX_HOME=/root/.hex \
+    HEX_OFFLINE=0 \
+    CARGO_HOME=/root/.cargo \
+    RUSTUP_HOME=/root/.rustup \
+    PATH=/root/.cargo/bin:/usr/local/bin:$PATH
+
+# `bubblewrap` is what the compile-helper drives on Linux. `inotify-tools`
+# lets Phoenix code reloading see filesystem events through bind mounts.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        inotify-tools \
+        pkg-config \
+        bubblewrap \
+        libssl-dev \
+        postgresql-client \
+        netcat-openbsd \
+        procps \
+        jq \
+        xz-utils \
+        sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --default-toolchain 1.85.0 --profile minimal && \
+    /root/.cargo/bin/cargo install cargo-watch --locked
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | \
+        bash -s -- --to /usr/local/bin
+
+RUN /root/.cargo/bin/cargo install nixfmt --locked || true
+
+# Production prewarms catalog flakes which populate /nix/store; we do the
+# same here so dev and prod resolve identical /nix/store paths. The binary
+# cache at cache.nixos.org provides pre-built artifacts on aarch64-linux
+# and x86_64-linux
+RUN curl --proto '=https' --tlsv1.2 -sSf -L \
+        https://install.determinate.systems/nix \
+        | sh -s -- install linux --no-confirm --init none \
+            --extra-conf "sandbox = false" \
+            --extra-conf "filter-syscalls = false"
+
+# Put Nix on PATH so subsequent layers (and the running engine) see it
+ENV PATH=/nix/var/nix/profiles/default/bin:/root/.nix-profile/bin:$PATH
+
+# Prewarm the catalog: install each runtime's executable into the default
+# Nix profile. `nix profile install` populates /nix/store from the public
+# binary cache so the runtime catalog's `resolve_bin` (which walks $PATH
+# then canonicalizes through symlinks) returns /nix/store paths
+# the same as production.
+RUN /nix/var/nix/profiles/default/bin/nix \
+        --extra-experimental-features 'nix-command flakes' \
+        profile install \
+            nixpkgs#python313 \
+            nixpkgs#nodejs_22 \
+            nixpkgs#go \
+            nixpkgs#gcc \
+            nixpkgs#rustc
+
+RUN mix local.hex --force && mix local.rebar --force
+WORKDIR /app
+EXPOSE 4000
+ENV MIX_ENV=dev \
+    PHX_HOST=localhost \
+    PGHOST=postgres \
+    PGUSER=postgres \
+    PGPASSWORD=postgres \
+    PGDATABASE=rockbox_dev \
+    ROCKBOX_ENGINE_BIN=/app/core/target/debug/engine \
+    ROCKBOX_DATA_SOCK_DIR=/tmp/rockbox-data
+
+# The compose file overrides `command:` per-service; this default boots the
+# Phoenix server with the standard dev-stack wait+migrate dance
+CMD ["just", "docker-app-serve"]
