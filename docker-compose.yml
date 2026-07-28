@@ -1,0 +1,95 @@
+# Everything bind-mounts your source tree so edits on the host trigger
+# hot-reloads inside the container:
+#   - Phoenix code reloads `.ex/.exs` automatically.
+#   - `cargo-watch` rebuilds the Rust engine + compiler on `.rs`/`Cargo.toml` change
+name: rockbox
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rockbox_dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  engine-watch:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /app
+    command: ["just", "docker-engine-watch"]
+    volumes:
+      - .:/app
+      - cargo_cache:/root/.cargo/registry
+      - cargo_git:/root/.cargo/git
+      - target_cache:/app/core/target
+    environment:
+      CARGO_INCREMENTAL: "1"
+      RUST_BACKTRACE: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /app/core/target/debug/engine || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 120s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /app
+    command: ["just", "docker-app-serve"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      engine-watch:
+        condition: service_started
+    ports:
+      - "4000:4000"
+    # Sandbox needs CAP_SYS_ADMIN (unshare namespaces, mount, cgroup write),
+    # an unconfined host AppArmor (we ship our own profiles inside), and an
+    # unconfined host seccomp (the docker default blocks clone3+CLONE_NEWUSER).
+    # Production uses fine-grained caps + the rockbox AppArmor profile
+    # `privileged` here is a dev convenience only
+    privileged: true
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
+    cgroup: host
+    volumes:
+      - .:/app
+      - deps_cache:/app/deps
+      - build_cache:/app/_build
+      - target_cache:/app/core/target
+    environment:
+      MIX_ENV: dev
+      PHX_HOST: localhost
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: rockbox_dev
+      ROCKBOX_ENGINE_BIN: /app/core/target/debug/engine
+      ROCKBOX_DATA_SOCK_DIR: /tmp/rockbox-data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:4000/health >/dev/null"]
+      interval: 5s
+      timeout: 2s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  pgdata:
+  deps_cache:
+  build_cache:
+  cargo_cache:
+  cargo_git:
+  target_cache:
