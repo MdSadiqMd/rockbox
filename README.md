@@ -2,9 +2,19 @@
 
 Elixir orchestrator + Rust execution engine for running arbitrary code (and RL environments) inside a 10-layer Linux sandbox
 
-> Native execution. No WASM, no VMs. Sandbox launch overhead is ~2-6 ms;
-> measured end-to-end (Linux, release engine): ~13 ms p50 Python, ~62 ms
-> TypeScript, ~90-370 ms compiled (per-request compile), ~36 ms/step RL
+Send code, the orchestrator hands it to a pooled VM, the Rust engine clone3()s a namespaced child, and user code runs natively under seccomp/AppArmor/cgroups, no WASM, no VMs
+
+Brief info of how it works
+1. A POST /api/execute arrives settings go through a 14-step pipeline (schema validate → merge defaults → clamp to tier ceilings → resolve secrets → reserve quota) that freezes into an immutable `%Effective{}`
+2. Pool.Manager hands out a hot VM from ETS (O(1)) or cold-spawns one, one VM = one Erlang Port = one Rust engine OS process
+3. Control travels over the Port as 4-byte-framed msgpack; stdout/stderr stream back over a SOCK_SEQPACKET data channel batched 4ms/4KB
+4. The engine resolves settings into a ChildSpec, env vars from a memfd cache (nix print-dev-env), binaries from a verified-fd cache, or bwrap-compiled on miss
+5. SandboxLauncher creates a cgroup (memory.max, cpu.max, pids.max), pre-creates stdout/stderr/sync pipes, compiles seccomp BPF (cached per profile), then clone3(NEWUSER|NEWPID|NEWNS|NEWNET|NEWIPC|NEWUTS|PIDFD)
+6. The parent writes /proc/child uid_map/gid_map (0 → host 65534), adds the child to the cgroup, and releases the sync pipe; the child setresuid(0) and proceeds
+7. The child assembles the 10 layers: mount NS with bind-mounted RO /nix/store + RO workdir + pivot_root, AppArmor aa_change_onexec, NO_NEW_PRIVS (before seccomp), cached BPF per language profile, drops all 41 capabilities, sets RLIMITs (FSIZE=50MB, NOFILE=256, STACK=8MB), dup2s the pipes, execve()
+8. User code runs native, launch overhead ~2-6 ms, measured end-to-end ~13 ms p50 Python / ~62 ms TypeScript / ~90-370 ms compiled (per-request compile), output drains via io_uring (stdout + stderr + pidfd)
+9. Teardown is atomic: normal exit, timeout, or output-cap overrun all end in waitid(P_PIDFD) for the real exit code, cgroup reset and returned to the pool, `exec` VMs stopped after one request
+10. Session/RL modes skip teardown, the VM returns to the hot pool and the same engine process re-runs cells/steps against a persistent /session or /episode RW volume (globals pickled to state.pkl), ~36 ms/step RL
 
 ## Architecture 
 
@@ -61,7 +71,7 @@ flowchart TB
     E4 --> E5 -->|push| C1
 ```
 
-## Protocol Flow: Request Lifecycle
+### Protocol Flow: Request Lifecycle
 
 ```mermaid
 sequenceDiagram
@@ -149,7 +159,7 @@ sequenceDiagram
     end
 ```
 
-## Elixir ↔ Rust Communication
+### Elixir ↔ Rust Communication
 
 ```mermaid
 sequenceDiagram
@@ -193,7 +203,7 @@ sequenceDiagram
     end
 ```
 
-## 10-Layer Linux Sandbox
+### 10-Layer Linux Sandbox
 
 ```mermaid
 sequenceDiagram
@@ -267,7 +277,7 @@ sequenceDiagram
     end
 ```
 
-## Session Mode (REPL/Notebook)
+### Session Mode (REPL/Notebook)
 
 ```mermaid
 sequenceDiagram
@@ -332,7 +342,7 @@ sequenceDiagram
     end
 ```
 
-## RL Mode (Reinforcement Learning)
+### RL Mode (Reinforcement Learning)
 
 ```mermaid
 sequenceDiagram
@@ -392,7 +402,7 @@ sequenceDiagram
     end
 ```
 
-## Pool Management + Autoscaling
+### Pool Management + Autoscaling
 
 ```mermaid
 sequenceDiagram
@@ -466,7 +476,7 @@ sequenceDiagram
     end
 ```
 
-## Master End-to-End Sequence
+### Master End-to-End Sequence
 
 ```mermaid
 sequenceDiagram
@@ -666,24 +676,29 @@ sequenceDiagram
     end
 ```
 
-## Quickstart (dev)
+## Develop
 
-Requires Erlang 26+, Elixir 1.18+, Postgres 15+, Rust 1.85+ (edition 2024).
+Requires Erlang 26+, Elixir 1.18+, Postgres 15+, Rust 1.85+ (edition 2024), `just`.
 
 ```bash
-# 1. Fetch deps + set up the dev DB
-make setup
-
-# 2. Build the Rust engine (release mode)
-make engine
-
-# 3. Start the Phoenix server
-make server
+just setup        # mix deps.get + create + migrate the dev DB
+just engine       # release build of engine + compiler (core/target/release)
+just engine-watch # watch + rebuild the Rust engine on every change
+just server       # Phoenix in foreground (auto code reload) on :4000
+just test         # all tests: Rust workspace + Elixir
+just test-rust    # cargo test --workspace --lib
+just test-elixir  # mix test
+just fmt-check    # CI gate: rustfmt + mix format + nixfmt
+just lint         # cargo clippy -D warnings + credo + dialyzer
+just demo-python  # smoke the stack: POST priv/samples/python/hello.py to /api/execute
+just docker-up    # full sandbox stack via docker compose (Linux + privileged required)
+just docker-test  # test suites inside the running stack (container Postgres)
+just docker-logs  # tail all services
 ```
 
-On macOS the Rust engine builds and runs but **does not sandbox** (Linux-only primitives are cfg-gated to no-op stubs). Use a Linux box / VM / container for end-to-end testing of the sandbox itself
+On macOS the Rust engine builds and runs but **does not sandbox** (Linux-only primitives are cfg-gated to no-op stubs). Use a Linux box / VM / `just docker-up` for end-to-end testing of the sandbox itself
 
-## Try it
+#### Try it
 
 ```bash
 curl -X POST http://localhost:4000/api/execute \
@@ -701,8 +716,7 @@ curl -X POST http://localhost:4000/api/execute \
 
 ## Benchmarks vs Alternatives (2026)
 
-Rockbox compared against leading AI code execution sandboxes. Data sourced from
-third-party benchmarks and official documentation — see sources below.
+Rockbox compared against leading AI code execution sandboxes. Data sourced from third-party benchmarks and official documentation
 
 ### Cold Start Latency
 
@@ -715,14 +729,7 @@ third-party benchmarks and official documentation — see sources below.
 
 #### Methodology (Rockbox numbers)
 
-Measured July 2026 on the `docker compose` stack (Linux container, privileged)
-with the **release** engine build (`ROCKBOX_ENGINE_BIN=core/target/release/engine`):
-`curl → POST /api/execute` wall time for `print(2+2)` / `console.log(2+2)` /
-trivial Go/Rust/C++ programs. Warm column: 10 requests per language (min-free
-percentiles); cold column: first request after an app-service restart.
-`exec_time_ms` is engine-internal (sandbox launch → drain); the gap to wall
-time is HTTP ingress + settings pipeline (incl. the Postgres audit write) +
-pool + port + engine process boot.
+Measured July 2026 on the `docker compose` stack (Linux container, privileged) with the **release** engine build (`ROCKBOX_ENGINE_BIN=core/target/release/engine`): `curl → POST /api/execute` wall time for `print(2+2)` / `console.log(2+2)` / trivial Go/Rust/C++ programs. Warm column: 10 requests per language (min-free percentiles); cold column: first request after an app-service restart. `exec_time_ms` is engine-internal (sandbox launch → drain); the gap to wall time is HTTP ingress + settings pipeline (incl. the Postgres audit write) + pool + port + engine process boot
 
 | Language | Cold (fresh app) | Warm p50 | Warm p95 | Engine exec p50 |
 |----------|------------------|----------|----------|-----------------|
@@ -733,21 +740,10 @@ pool + port + engine process boot.
 | C++ | 351 ms | 367 ms | 382 ms | 23 ms |
 
 Notes:
-- Interpreter boot dominates interpreted runs (CPython ~15-40 ms, Node
-  ~20-80 ms); the ~2-6 ms figure is launch overhead only, not a full request.
-- A debug engine build roughly doubles Python p50 (29 ms vs 13 ms); compiled
-  languages are unaffected (compilers + interpreter boot dominate).
-- Compiled languages recompile on every request — verified: the `cache`
-  crate (`BinaryCache`/`EnvCache`) is instantiated in `EngineState`
-  (`core/crates/engine/src/state.rs`) but never called, and the `compiler`
-  compile-helper binary (which implements the `/var/cache/sandbox/bin`
-  cache) is not started by the compose stack and has no socket client in the
-  engine. Observed: `rustc` subprocess per request, no cache dir ever
-  created, identical requests stay at ~90-100 ms (sandbox exec is only
-  20-23 ms of that). Wiring the helper in should bring compiled requests
-  down to the `exec_time_ms` column.
-- `exec` mode stops the VM after each request, so every request pays a fresh
-  engine-process boot; session/RL modes reuse the VM.
+- Interpreter boot dominates interpreted runs (CPython ~15-40 ms, Node ~20-80 ms); the ~2-6 ms figure is launch overhead only, not a full request
+- A debug engine build roughly doubles Python p50 (29 ms vs 13 ms); compiled languages are unaffected (compilers + interpreter boot dominate)
+- Compiled languages recompile on every request — verified: the `cache` crate (`BinaryCache`/`EnvCache`) is instantiated in `EngineState` (`core/crates/engine/src/state.rs`) but never called, and the `compiler` compile-helper binary (which implements the `/var/cache/sandbox/bin` cache) is not started by the compose stack and has no socket client in the engine. Observed: `rustc` subprocess per request, no cache dir ever created, identical requests stay at ~90-100 ms (sandbox exec is only 20-23 ms of that). Wiring the helper in should bring compiled requests down to the `exec_time_ms` column
+- `exec` mode stops the VM after each request, so every request pays a fresh engine-process boot; session/RL modes reuse the VM
 
 ### RL Step Latency (Hot Path)
 
