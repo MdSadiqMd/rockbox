@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 use protocol::{MAX_FRAME_BYTES, ProtocolError, Result};
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -81,14 +81,14 @@ where
                 limit: MAX_FRAME_BYTES,
             });
         }
-        let mut scratch = BytesMut::with_capacity(4 + payload.len());
-        scratch.put_u32(payload.len() as u32);
-        scratch.put_slice(&payload);
-
+        // Length prefix + payload in two writes under one lock hold: no
+        // intermediate scratch buffer, no full-frame memcpy.
+        let len = (payload.len() as u32).to_be_bytes();
         let mut w = self.inner.lock().await;
-        w.write_all(&scratch).await.map_err(io_err)?;
+        w.write_all(&len).await.map_err(io_err)?;
+        w.write_all(&payload).await.map_err(io_err)?;
         w.flush().await.map_err(io_err)?;
-        trace!(bytes = scratch.len(), "frame_out");
+        trace!(bytes = payload.len() + 4, "frame_out");
         Ok(())
     }
 }
