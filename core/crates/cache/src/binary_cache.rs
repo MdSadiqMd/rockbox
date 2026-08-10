@@ -149,6 +149,45 @@ impl BinaryCache {
         debug!("binary_cache_hit");
         Ok(handle)
     }
+
+    /// Persist a freshly compiled artifact under `main.bin` + `main.sha256`
+    /// and return a verified handle for immediate use. Best-effort from the
+    /// engine's perspective: the cache dir may be read-only (privileged
+    /// deployments compile via the separate `compiler` helper instead).
+    ///
+    /// Takes the on-disk artifact path — the compiled binary already lives
+    /// in the content-addressed work dir — so the hot byte buffer written by
+    /// the compiler is streamed once via `fs::copy` instead of being read
+    /// into engine memory and rewritten.
+    #[instrument(skip(self, artifact), fields(key = %key.digest))]
+    pub fn store(&self, key: &BinaryKey, artifact: &Path) -> std::io::Result<Arc<BinaryHandle>> {
+        let dir = self.dir_for(key);
+        std::fs::create_dir_all(&dir)?;
+        let bin_path = dir.join("main.bin");
+        // fs::copy streams from the source fd — no full read into RAM.
+        std::fs::copy(artifact, &bin_path)?;
+        // The engine execve()s the cached artifact through `/proc/self/fd/N`,
+        // and the kernel checks the inode's execute bit on that path — 0644
+        // from the copy above would be EACCES at exec time.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&bin_path)?.permissions();
+            perm.set_mode(0o555);
+            std::fs::set_permissions(&bin_path, perm)?;
+        }
+        let mut file = std::fs::File::open(&bin_path)?;
+        let digest = stream_sha256(&mut file)?;
+        std::fs::write(dir.join("main.sha256"), digest.to_hex())?;
+        let handle = Arc::new(BinaryHandle {
+            fd_path: fd_path_for(&file),
+            file,
+            digest,
+        });
+        self.handles.insert(key.clone(), handle.clone());
+        debug!("binary_cache_stored");
+        Ok(handle)
+    }
 }
 
 fn stream_sha256(file: &mut std::fs::File) -> std::io::Result<Sha256Digest> {
