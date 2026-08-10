@@ -12,7 +12,7 @@ config :rockbox, Rockbox.Repo,
 config :rockbox, RockboxWeb.Endpoint,
   # Bind to all interfaces so Docker port forwarding works. On a Linux host
   # you can tighten this to {127, 0, 0, 1} if exposing 4000 publicly is a concern
-  http: [ip: {0, 0, 0, 0}, port: 4000],
+  http: [ip: {0, 0, 0, 0}, port: System.get_env("PORT") || 4000],
   check_origin: false,
   debug_errors: true,
   secret_key_base: String.duplicate("a", 64),
