@@ -42,6 +42,9 @@ pub enum SandboxError {
     #[error("capability drop failed: {0}")]
     CapDrop(String),
 
+    #[error("netns template failed: {0}")]
+    Net(String),
+
     #[error("output cap exceeded ({bytes} > {limit})")]
     OutputCap { bytes: u64, limit: u64 },
 

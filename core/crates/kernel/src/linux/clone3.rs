@@ -30,7 +30,9 @@ struct CloneArgs {
 }
 
 // CLONE_INTO_CGROUP not yet in libc 0.2 on all targets; define manually.
-const CLONE_INTO_CGROUP: u64 = 0x2000_0000_0000;
+// Kernel constant is 0x200000000 (bit 33); a wrong value here makes every
+// clone3 fail with EINVAL and forces the slow add_pid fallback.
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 const CLONE_PIDFD: u64 = 0x0000_1000;
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 

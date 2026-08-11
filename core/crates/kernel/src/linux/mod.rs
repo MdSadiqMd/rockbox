@@ -4,7 +4,8 @@
 //! `docs/nix_sandbox_flowchart.md`:
 //!
 //! - [`clone3`] — fused clone + pidfd + cgroup placement (PERF-06 + SEC-17)
-//! - [`userns`] — uid_map + setgroups deny + sync pipe (SEC-02)
+//! - [`userns`] — uid_map + setgroups deny, written by the child (SEC-02)
+//! - [`netns`] — recycled `lo`-up template namespace (PERF)
 //! - [`mounts`] — pivot_root + tmpfs + bind mounts (SEC-10 + PERF-11)
 //! - [`apparmor`] — `change_onexec` to per-uuid profile (SEC-09 + SEC-25)
 //! - [`cgroup`] — v2 + `cgroup.kill` (PERF-10)
@@ -23,20 +24,19 @@ pub mod clone3;
 pub mod drain;
 pub mod launcher;
 pub mod mounts;
+pub mod netns;
 pub mod pidfd;
 pub mod seccomp;
 pub mod userns;
 
-pub use apparmor::{change_onexec, is_available as apparmor_is_available};
+pub use apparmor::{change_command, is_available as apparmor_is_available, write_attr_exec};
 pub use caps::{apply_rlimits, drop_all_capabilities, enable_mdwe, set_no_new_privs};
 pub use cgroup::{CGROUP_ROOT, Cgroup, CgroupConfig};
 pub use clone3::{CloneRequest, Cloned, clone3};
 pub use drain::{ChildExit, Drainer};
 pub use launcher::{ChildHandle, SandboxLauncher};
 pub use mounts::MountPlan;
+pub use netns::NetnsTemplate;
 pub use pidfd::{open as pidfd_open, send_signal as pidfd_send_signal};
 pub use seccomp::{BpfProfile, SeccompResolver};
-pub use userns::{
-    NOBODY_GID, NOBODY_UID, SyncPipe, child_wait_for_release, make_sync_pipe, release_child,
-    write_id_maps,
-};
+pub use userns::{NOBODY_GID, NOBODY_UID, parent_write_id_maps};

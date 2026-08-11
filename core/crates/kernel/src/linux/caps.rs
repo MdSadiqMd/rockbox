@@ -2,7 +2,6 @@
 //! Called from the child after seccomp install but before final execve
 use crate::error::{SandboxError, SandboxResult};
 use crate::spec::ResourceLimits;
-use caps::{CapSet, Capability};
 use nix::sys::resource::{Resource, setrlimit};
 
 pub fn set_no_new_privs() -> SandboxResult<()> {
@@ -33,20 +32,80 @@ pub fn enable_mdwe() -> SandboxResult<()> {
     Ok(())
 }
 
+const CAP_LAST_CAP: u32 = 40;
+
 pub fn drop_all_capabilities() -> SandboxResult<()> {
-    // Drop bounding, ambient, inheritable, effective, permitted in that order.
-    caps::clear(None, CapSet::Bounding).map_err(cap_err)?;
-    caps::clear(None, CapSet::Ambient).map_err(cap_err)?;
-    caps::clear(None, CapSet::Inheritable).map_err(cap_err)?;
-    caps::clear(None, CapSet::Effective).map_err(cap_err)?;
-    caps::clear(None, CapSet::Permitted).map_err(cap_err)?;
-    debug_assert!(
-        caps::read(None, CapSet::Effective)
-            .unwrap_or_default()
-            .is_empty()
-    );
-    // Silence unused-import warning when assertions are off.
-    let _ = Capability::CAP_SYS_ADMIN;
+    // Bounding set first — once a cap leaves the bounding set it can never
+    // be re-acquired, so this runs before the capset() that empties the
+    // inheritable/permitted/effective sets.
+    //
+    // Runs in the fork child: raw prctl/capset only. Success path is
+    // allocation-free (no glibc arena lock before exec).
+    for cap in 0..=CAP_LAST_CAP {
+        // SAFETY: prctl is a stable syscall.
+        let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) };
+        if rc != 0 {
+            return Err(SandboxError::CapDrop(format!(
+                "PR_CAPBSET_DROP {cap}: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    // SAFETY: PR_CAP_AMBIENT_CLEAR_ALL is a stable prctl.
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(SandboxError::CapDrop(format!(
+            "PR_CAP_AMBIENT_CLEAR_ALL: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // capset() clears inheritable/permitted/effective in one syscall. The
+    // kernel ABI structs aren't all exported by every libc version — define
+    // them (identical layout to linux/capability.h v3).
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+    let header = CapHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: capset is a stable syscall; header + data are initialized.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &header as *const CapHeader,
+            data.as_ptr() as *const CapData,
+        )
+    };
+    if rc != 0 {
+        return Err(SandboxError::CapDrop(format!(
+            "capset: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     Ok(())
 }
 
@@ -70,8 +129,4 @@ fn set(res: Resource, val: u64, name: &'static str) -> SandboxResult<()> {
         limit: name,
         source: std::io::Error::from_raw_os_error(e as i32),
     })
-}
-
-fn cap_err(e: caps::errors::CapsError) -> SandboxError {
-    SandboxError::CapDrop(e.to_string())
 }

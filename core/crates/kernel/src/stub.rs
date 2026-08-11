@@ -112,4 +112,5 @@ impl SandboxLauncher {
     pub fn make_drainer(&self, _h: ChildHandle, _cap: u64) -> SandboxResult<(Cgroup, Drainer)> {
         Err(SandboxError::Unsupported)
     }
+    pub fn release_cgroup(&self, _cg: Cgroup) {}
 }

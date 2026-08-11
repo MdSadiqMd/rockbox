@@ -98,23 +98,37 @@ impl Drainer {
             for ev in &events[..n as usize] {
                 match ev.u64 {
                     1 => {
-                        if let Some(chunk) = read_chunk(&self.stdout, &mut buf)? {
-                            sent_bytes = sent_bytes.saturating_add(chunk.len() as u64);
-                            if sent_bytes > self.output_cap {
-                                cg.kill_all()?;
-                                return Ok(ChildExit::OutputCap);
+                        // Drain until EAGAIN so the epoll wakeup is amortized
+                        // over every buffered byte, not one byte per wakeup.
+                        let mut done = false;
+                        while !done {
+                            match read_chunk(&self.stdout, &mut buf)? {
+                                Some(chunk) => {
+                                    sent_bytes = sent_bytes.saturating_add(chunk.len() as u64);
+                                    if sent_bytes > self.output_cap {
+                                        cg.kill_all()?;
+                                        return Ok(ChildExit::OutputCap);
+                                    }
+                                    on_stdout(chunk);
+                                }
+                                None => done = true,
                             }
-                            on_stdout(chunk);
                         }
                     }
                     2 => {
-                        if let Some(chunk) = read_chunk(&self.stderr, &mut buf)? {
-                            sent_bytes = sent_bytes.saturating_add(chunk.len() as u64);
-                            if sent_bytes > self.output_cap {
-                                cg.kill_all()?;
-                                return Ok(ChildExit::OutputCap);
+                        let mut done = false;
+                        while !done {
+                            match read_chunk(&self.stderr, &mut buf)? {
+                                Some(chunk) => {
+                                    sent_bytes = sent_bytes.saturating_add(chunk.len() as u64);
+                                    if sent_bytes > self.output_cap {
+                                        cg.kill_all()?;
+                                        return Ok(ChildExit::OutputCap);
+                                    }
+                                    on_stderr(chunk);
+                                }
+                                None => done = true,
                             }
-                            on_stderr(chunk);
                         }
                     }
                     3 => {
