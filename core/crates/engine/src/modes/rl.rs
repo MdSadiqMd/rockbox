@@ -295,7 +295,7 @@ async fn run_rl_step(
         0,
         FileEntry {
             path: SHIM_FILENAME.to_string(),
-            content: python_shim().into_bytes(),
+            content: python_shim().as_bytes().to_vec(),
             mode: 0o644,
         },
     );
@@ -333,17 +333,27 @@ async fn execute_and_drain(
     settings: Settings,
     data: Option<&DataChannel>,
 ) -> Result<()> {
-    let work_root: PathBuf = std::env::temp_dir().join("rockbox-work");
-    std::fs::create_dir_all(&work_root)?;
-    let resolved = resolver_spec::resolve(&settings, &work_root).context("resolve spec")?;
+    let work_root = crate::modes::work_root();
     let launcher = state
         .launcher
         .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("no launcher"))?;
-    let handle = launcher.launch(&resolved.spec).context("launch")?;
+    let binary_cache = state.binary_cache.clone();
+    let output_bytes = settings.limits.output_bytes;
+    let stream_enabled = settings.output.stream;
+
+    let handle = {
+        let launcher = launcher.clone();
+        let resolve = tokio::task::spawn_blocking(move || {
+            let resolved = resolver_spec::resolve(&settings, work_root, Some(&binary_cache))
+                .context("resolve spec")?;
+            launcher.launch(&resolved.spec).context("launch")
+        });
+        resolve.await.context("resolve/launch join")??
+    };
     let (cg, mut drainer) = launcher
-        .make_drainer(handle, settings.limits.output_bytes)
+        .make_drainer(handle, output_bytes)
         .context("make_drainer")?;
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<(Stream, Vec<u8>)>();
@@ -366,14 +376,17 @@ async fn execute_and_drain(
     });
 
     while let Some((stream, bytes)) = chunk_rx.recv().await {
-        if let Some(d) = data {
-            let _ = d.send(stream, &bytes).await;
+        if stream_enabled {
+            if let Some(d) = data {
+                d.send(stream, bytes);
+            }
         }
     }
-    let _ = blocking
+    let (cg, _child_exit) = blocking
         .await
         .context("drainer join")?
         .context("drainer run")?;
+    launcher.release_cgroup(cg);
     Ok(())
 }
 
@@ -416,7 +429,7 @@ mod tests {
     }
 }
 
-fn python_shim() -> String {
+fn python_shim() -> &'static str {
     // The shim expects the user's env module to expose either:
     //   - `reset()` → observation (bytes | bytes-like)
     //   - `step(action_bytes)` → (observation_bytes, reward: float, done: bool, info: dict[str, str])
@@ -424,7 +437,9 @@ fn python_shim() -> String {
     // State persistence is opt-in: if the module also exposes `save()`
     // / `restore(state)` we shuttle a pickle through /episode/state.pkl.
     // Otherwise the module is imported fresh each tick.
-    r#"import base64, importlib.util, json, os, pickle, sys, traceback
+    static SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHIM.get_or_init(|| {
+        r#"import base64, importlib.util, json, os, pickle, sys, traceback
 
 EPISODE = "/episode"
 STATE = os.path.join(EPISODE, "state.pkl")
@@ -509,5 +524,6 @@ with open(TICK, "w", encoding="utf-8") as f:
 sys.stdout.flush()
 sys.stderr.flush()
 "#
-    .to_string()
+        .to_string()
+    })
 }

@@ -10,12 +10,25 @@ use crate::state::EngineState;
 use anyhow::Result;
 use msgpack::FrameWriter;
 use protocol::{Mode, Response, Settings};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::io::Stdout;
 
 pub mod exec;
 pub mod lsp;
 pub mod rl;
 pub mod session;
+
+/// `/tmp/rockbox-work` is process-global; mkdir it once, not per request.
+/// Every mode joins its request work dirs under this root.
+pub fn work_root() -> &'static PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let p = std::env::temp_dir().join("rockbox-work");
+        let _ = std::fs::create_dir_all(&p);
+        p
+    })
+}
 
 pub async fn dispatch(
     state: &EngineState,

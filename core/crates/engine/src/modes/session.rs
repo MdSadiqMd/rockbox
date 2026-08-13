@@ -24,7 +24,7 @@
 //! 3. Subsequent cells with the same `session_id` re-enter step 2; state
 //!    accumulates on disk between calls.
 
-use crate::data_channel::DataChannel;
+use crate::data_channel::{DataChannel, Stream};
 use crate::resolver::spec as resolver_spec;
 use crate::state::EngineState;
 use anyhow::{Context, Result, anyhow};
@@ -174,7 +174,6 @@ pub async fn run_cell(
 
     let (shim_name, shim_body, cell_ext) = language_shim(base.language);
     let cell_filename = format!("{CELL_FILENAME}.{cell_ext}");
-
     // Build the per-cell settings by cloning the base and swapping the
     // entrypoint + files. Cell code goes to a stable, non-user-controlled
     // filename so the shim can locate it deterministically.
@@ -195,7 +194,7 @@ pub async fn run_cell(
     let mut file_bundle = Vec::with_capacity(2 + files.len());
     file_bundle.push(FileEntry {
         path: shim_name.to_string(),
-        content: shim_body.into_bytes(),
+        content: shim_body.as_bytes().to_vec(),
         mode: 0o644,
     });
     file_bundle.push(FileEntry {
@@ -311,23 +310,30 @@ async fn run_exec_pipeline(
     // We can't fully piggyback on modes::exec::run because it writes a
     // Result frame — we want the shim's structured output on a CellResult
     // frame instead. So we duplicate the tight loop but discard the frame.
-    use crate::data_channel::Stream;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
-    let work_root: PathBuf = std::env::temp_dir().join("rockbox-work");
-    std::fs::create_dir_all(&work_root)?;
-    let resolved = resolver_spec::resolve(&settings, &work_root).context("resolve spec")?;
-
+    let work_root = crate::modes::work_root();
     let launcher = state
         .launcher
         .as_ref()
         .cloned()
         .ok_or_else(|| anyhow!("no launcher"))?;
+    let binary_cache = state.binary_cache.clone();
+    let output_bytes = settings.limits.output_bytes;
+    let stream_enabled = settings.output.stream;
 
-    let handle = launcher.launch(&resolved.spec).context("launch")?;
+    let handle = {
+        let launcher = launcher.clone();
+        let resolve = tokio::task::spawn_blocking(move || {
+            let resolved = resolver_spec::resolve(&settings, work_root, Some(&binary_cache))
+                .context("resolve spec")?;
+            launcher.launch(&resolved.spec).context("launch")
+        });
+        resolve.await.context("resolve/launch join")??
+    };
     let (cg, mut drainer) = launcher
-        .make_drainer(handle, settings.limits.output_bytes)
+        .make_drainer(handle, output_bytes)
         .context("make_drainer")?;
 
     let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<(Stream, Vec<u8>)>();
@@ -350,15 +356,18 @@ async fn run_exec_pipeline(
     });
 
     while let Some((stream, bytes)) = chunk_rx.recv().await {
-        if let Some(d) = data {
-            let _ = d.send(stream, &bytes).await;
+        if stream_enabled {
+            if let Some(d) = data {
+                d.send(stream, bytes);
+            }
         }
     }
 
-    let _ = blocking
+    let (cg, _child_exit) = blocking
         .await
         .context("drainer join")?
         .context("drainer run")?;
+    launcher.release_cgroup(cg);
     Ok(())
 }
 
@@ -393,7 +402,7 @@ const fn supports_session(lang: Language) -> bool {
     matches!(lang, Language::Python | Language::Typescript)
 }
 
-fn language_shim(lang: Language) -> (&'static str, String, &'static str) {
+fn language_shim(lang: Language) -> (&'static str, &'static str, &'static str) {
     match lang {
         Language::Python => (SHIM_FILENAME_PY, python_shim(), "py"),
         Language::Typescript => (SHIM_FILENAME_JS, typescript_shim(), "mjs"),
@@ -402,21 +411,20 @@ fn language_shim(lang: Language) -> (&'static str, String, &'static str) {
             // practice; return an empty shim so the caller still gets a file
             // and the resolver doesn't panic.
             warn!(?lang, "language_shim_unsupported");
-            (
-                ".rockbox_session_shim.sh",
-                String::from("#!/bin/false\n"),
-                "txt",
-            )
+            (".rockbox_session_shim.sh", "#!/bin/false\n", "txt")
         }
     }
 }
 
 /// Python session shim. Restores namespace from `/session/state.pkl`,
 /// executes the cell, dumps namespace back, writes structured result to
-/// `/session/.rockbox_cell_result.json`.
-fn python_shim() -> String {
-    format!(
-        r#"import os, sys, json, io, traceback, pickle
+/// `/session/.rockbox_cell_result.json`. Built once per engine process —
+/// the 60-line body was being re-formatted on every cell run.
+fn python_shim() -> &'static str {
+    static SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHIM.get_or_init(|| {
+        format!(
+            r#"import os, sys, json, io, traceback, pickle
 
 STATE_PATH = "/session/state.pkl"
 RESULT_PATH = "/session/{result_file}"
@@ -482,9 +490,10 @@ sys.stdout.flush()
 sys.stderr.flush()
 sys.exit(0 if result["status"] == "ok" else 1)
 "#,
-        result_file = CELL_RESULT_FILE,
-        cell_file = CELL_FILENAME,
-    )
+            result_file = CELL_RESULT_FILE,
+            cell_file = CELL_FILENAME,
+        )
+    })
 }
 
 #[cfg(test)]
@@ -545,9 +554,11 @@ mod tests {
 /// and JSON for the on-disk state format (structuredClone-compatible values
 /// only — functions and classes don't survive; this matches Jupyter's kernel
 /// isolation semantics for JS notebooks).
-fn typescript_shim() -> String {
-    format!(
-        r#"import {{ readFileSync, writeFileSync, existsSync }} from "node:fs";
+fn typescript_shim() -> &'static str {
+    static SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHIM.get_or_init(|| {
+        format!(
+            r#"import {{ readFileSync, writeFileSync, existsSync }} from "node:fs";
 import vm from "node:vm";
 
 const STATE_PATH = "/session/state.json";
@@ -597,7 +608,8 @@ if (result.status === "ok") {{
 writeFileSync(RESULT_PATH, JSON.stringify(result));
 process.exit(result.status === "ok" ? 0 : 1);
 "#,
-        result_file = CELL_RESULT_FILE,
-        cell_file = CELL_FILENAME,
-    )
+            result_file = CELL_RESULT_FILE,
+            cell_file = CELL_FILENAME,
+        )
+    })
 }
