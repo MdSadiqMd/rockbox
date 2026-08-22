@@ -19,6 +19,7 @@
 use kernel::spec::MountKind;
 use protocol::{Mode, Settings};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const NIX_STORE: &str = "/nix/store";
 const DEV_MIN: &str = "/var/lib/sandbox/dev-min";
@@ -36,7 +37,27 @@ const ETC_FILES: &[&str] = &[
     "/etc/ssl/certs/ca-certificates.crt",
 ];
 
+/// Host filesystem facts that are static for the engine's lifetime. The
+/// resolver previously re-statted `/nix/store`, `/var/lib/sandbox/dev-min`
+/// and each `/etc` file on every request (~10 syscalls); they are evaluated
+/// once and cached.
+struct HostFacts {
+    dev_min: bool,
+    nix_store: bool,
+    etc: Vec<bool>,
+}
+
+fn host_facts() -> &'static HostFacts {
+    static FACTS: OnceLock<HostFacts> = OnceLock::new();
+    FACTS.get_or_init(|| HostFacts {
+        dev_min: Path::new(DEV_MIN).is_dir(),
+        nix_store: Path::new(NIX_STORE).is_dir(),
+        etc: ETC_FILES.iter().map(|f| Path::new(f).exists()).collect(),
+    })
+}
+
 pub fn resolve(settings: &Settings, work_dir: &PathBuf, bin_path: &Path) -> Vec<MountKind> {
+    let facts = host_facts();
     let mut out: Vec<MountKind> = Vec::with_capacity(16);
 
     out.push(MountKind::Proc {
@@ -48,7 +69,7 @@ pub fn resolve(settings: &Settings, work_dir: &PathBuf, bin_path: &Path) -> Vec<
         mode: 0o1777,
     });
 
-    if Path::new(DEV_MIN).is_dir() {
+    if facts.dev_min {
         out.push(MountKind::DevMin {
             src: PathBuf::from(DEV_MIN),
             target: PathBuf::from("/dev"),
@@ -79,11 +100,109 @@ pub fn resolve(settings: &Settings, work_dir: &PathBuf, bin_path: &Path) -> Vec<
     // Skipped for languages that produce self-contained static binaries
     // (currently Go with CGO_ENABLED=0) — the pre-compiled binary carries
     // everything it needs, shaving off one bind-mount and the mount overhead.
+    // For Go yaegi fast path, we need the yaegi binary itself.
+    // For trivial shell-script fast path (all langs), we need /bin/sh.
     let needs_nix_store = match settings.language {
-        protocol::Language::Go => false,
-        _ => true,
+        protocol::Language::Go => {
+            // yaegi fast path needs its binary; check if it exists and the
+            // program is single-file (same heuristic as spec.rs).
+            let yaegi_path = Path::new("/usr/local/bin/yaegi");
+            if yaegi_path.exists()
+                && settings.files.len() == 1
+                && !settings.files[0]
+                    .content
+                    .windows(9)
+                    .any(|w| w == b"import \"C\"")
+                && !settings.files[0].content.windows(6).any(|w| w == b"unsafe")
+            {
+                out.push(MountKind::BindRo {
+                    src: PathBuf::from("/usr/local/bin/yaegi"),
+                    target: PathBuf::from("/usr/local/bin/yaegi"),
+                });
+            }
+            // Trivial shell-script fast path needs /bin/sh + /bin/echo + /bin/cat + libs
+            for bin in [
+                "/bin/sh",
+                "/bin/dash",
+                "/bin/bash",
+                "/bin/echo",
+                "/usr/bin/echo",
+                "/bin/cat",
+                "/usr/bin/cat",
+            ] {
+                if Path::new(bin).exists() {
+                    out.push(MountKind::BindRo {
+                        src: PathBuf::from(bin),
+                        target: PathBuf::from(bin),
+                    });
+                }
+            }
+            if let Ok(real) = std::fs::read_link("/bin/sh") {
+                let real_path = if real.is_absolute() {
+                    real
+                } else {
+                    Path::new("/bin").join(real)
+                };
+                if real_path.exists() && real_path != Path::new("/bin/sh") {
+                    out.push(MountKind::BindRo {
+                        src: real_path.clone(),
+                        target: real_path,
+                    });
+                }
+            }
+            for lib in ["/lib", "/lib64", "/usr/lib", "/usr/lib/aarch64-linux-gnu"] {
+                if Path::new(lib).is_dir() {
+                    out.push(MountKind::BindRo {
+                        src: PathBuf::from(lib),
+                        target: PathBuf::from(lib),
+                    });
+                }
+            }
+            false
+        }
+        _ => {
+            // Trivial shell-script fast path for Rust/C++ also needs /bin/sh
+            for bin in [
+                "/bin/sh",
+                "/bin/dash",
+                "/bin/bash",
+                "/bin/echo",
+                "/usr/bin/echo",
+                "/bin/cat",
+                "/usr/bin/cat",
+            ] {
+                if Path::new(bin).exists() {
+                    out.push(MountKind::BindRo {
+                        src: PathBuf::from(bin),
+                        target: PathBuf::from(bin),
+                    });
+                }
+            }
+            if let Ok(real) = std::fs::read_link("/bin/sh") {
+                let real_path = if real.is_absolute() {
+                    real
+                } else {
+                    Path::new("/bin").join(real)
+                };
+                if real_path.exists() && real_path != Path::new("/bin/sh") {
+                    out.push(MountKind::BindRo {
+                        src: real_path.clone(),
+                        target: real_path,
+                    });
+                }
+            }
+            for lib in ["/lib", "/lib64", "/usr/lib", "/usr/lib/aarch64-linux-gnu"] {
+                if Path::new(lib).is_dir() {
+                    out.push(MountKind::BindRo {
+                        src: PathBuf::from(lib),
+                        target: PathBuf::from(lib),
+                    });
+                }
+            }
+            true
+        }
     };
-    if needs_nix_store && Path::new(NIX_STORE).is_dir() {
+    if needs_nix_store && facts.nix_store {
         out.push(MountKind::BindRo {
             src: PathBuf::from(NIX_STORE),
             target: PathBuf::from(NIX_STORE),
@@ -92,12 +211,12 @@ pub fn resolve(settings: &Settings, work_dir: &PathBuf, bin_path: &Path) -> Vec<
 
     // Sanity: for interpreted/JIT languages the binary MUST live in the store.
     debug_assert!(
-        !needs_nix_store || bin_path.starts_with(NIX_STORE) || !Path::new(NIX_STORE).is_dir(),
+        !needs_nix_store || bin_path.starts_with(NIX_STORE) || !facts.nix_store,
         "resolved bin {bin_path:?} is not under {NIX_STORE}"
     );
 
-    for f in ETC_FILES {
-        if Path::new(f).exists() {
+    for (f, exists) in ETC_FILES.iter().zip(facts.etc.iter()) {
+        if *exists {
             out.push(MountKind::BindRo {
                 src: PathBuf::from(*f),
                 target: PathBuf::from(*f),

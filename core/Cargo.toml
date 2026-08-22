@@ -24,7 +24,7 @@ cache    = { path = "crates/cache" }
 kernel   = { path = "crates/kernel" }
 
 # Runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "io-util", "io-std", "net", "fs", "process", "sync", "time", "signal"] }
+tokio = { version = "1.42", features = ["macros", "rt", "rt-multi-thread", "io-util", "io-std", "net", "sync", "time"] }
 
 # Serialization
 serde      = { version = "1.0", features = ["derive"] }
@@ -98,7 +98,7 @@ lto           = "thin"
 codegen-units = 1
 strip         = true
 panic         = "abort"
-debug         = 1
+debug         = 0
 opt-level     = 3
 
 [profile.release-fat]

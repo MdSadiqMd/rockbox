@@ -1,25 +1,39 @@
 //! High-rate stdout/stderr streaming channel (FIX ARCH-04 + PERF-12).
 //!
-//! Transport: `UnixStream` with a tiny framing header per chunk:
+//! Transport: a UNIX-domain **DGRAM** socket. The orchestrator binds a
+//! `:gen_udp` socket with `{:ip, {:local, path}}`; the engine sends framed
+//! datagrams to that path:
 //! ```text
 //!   1 byte  stream tag (0x01 stdout, 0x02 stderr)
 //!   4 bytes BE length
 //!   N bytes payload
 //! ```
 //!
-//! The orchestrator's GenServer reads framed chunks and broadcasts them on
-//! PubSub. Writer batches at the Drainer level (4ms / 4KB) so each send is
-//! at least one full kernel pipe-buffer worth — keeps syscall rate sane.
+//! The orchestrator's GenServer receives `{:udp, sock, ...}` messages and
+//! broadcasts them on PubSub. A background flusher task batches writes
+//! (1ms / 4KB, whichever comes first) so chatty children never pay one
+//! `sendto` per pipe chunk.
 
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
-use std::path::Path;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use std::path::{Path, PathBuf};
+use tokio::net::UnixDatagram;
+use tokio::sync::mpsc;
 
+/// Aggregate until the buffer reaches this size, then send in one syscall.
+const BATCH_BYTES: usize = 4 * 1024;
+/// Or flush whatever is buffered every this often. 1ms keeps streaming
+/// latency low for chatty children while still batching sub-message writes.
+const BATCH_PERIOD: std::time::Duration = std::time::Duration::from_millis(1);
+
+struct Chunk {
+    stream: Stream,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone)]
 pub struct DataChannel {
-    inner: Mutex<UnixStream>,
+    tx: mpsc::UnboundedSender<Chunk>,
 }
 
 impl std::fmt::Debug for DataChannel {
@@ -36,20 +50,64 @@ pub enum Stream {
 
 impl DataChannel {
     pub async fn connect(path: &Path) -> Result<Self> {
-        let sock = UnixStream::connect(path).await?;
-        Ok(Self {
-            inner: Mutex::new(sock),
-        })
+        // DGRAM semantics: no listener handshake — if the orchestrator's
+        // socket is gone, sends just fail silently (streaming is best-effort;
+        // the Result frame remains the source of truth for output).
+        let sock = UnixDatagram::unbound()?;
+        let dest = PathBuf::from(path);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Chunk>();
+        tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(BATCH_BYTES + 8);
+            let mut timer = tokio::time::interval(BATCH_PERIOD);
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut pending = false;
+            loop {
+                tokio::select! {
+                    maybe = rx.recv() => {
+                        match maybe {
+                            Some(chunk) => {
+                                buf.put_u8(chunk.stream as u8);
+                                buf.put_u32(chunk.payload.len() as u32);
+                                buf.put_slice(&chunk.payload);
+                                pending = true;
+                                if buf.len() >= BATCH_BYTES {
+                                    if flush_to(&sock, &dest, &buf).await.is_err() {
+                                        break;
+                                    }
+                                    buf.clear();
+                                    pending = false;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = timer.tick(), if pending => {
+                        if flush_to(&sock, &dest, &buf).await.is_err() {
+                            break;
+                        }
+                        buf.clear();
+                        pending = false;
+                    }
+                }
+            }
+            // Flush anything left before shutting down.
+            if pending {
+                let _ = flush_to(&sock, &dest, &buf).await;
+            }
+        });
+        Ok(Self { tx })
     }
 
-    pub async fn send(&self, stream: Stream, payload: &[u8]) -> Result<()> {
-        let mut frame = BytesMut::with_capacity(5 + payload.len());
-        frame.put_u8(stream as u8);
-        frame.put_u32(payload.len() as u32);
-        frame.put_slice(payload);
-        let mut guard = self.inner.lock().await;
-        guard.write_all(&frame).await?;
-        guard.flush().await?;
-        Ok(())
+    /// Queue a chunk for streaming. Never blocks: the flusher task owns the
+    /// socket and batches sends. `payload` is moved, not copied.
+    pub fn send(&self, stream: Stream, payload: Vec<u8>) {
+        let _ = self.tx.send(Chunk { stream, payload });
     }
+}
+
+async fn flush_to(sock: &UnixDatagram, dest: &Path, buf: &[u8]) -> Result<()> {
+    // One datagram per batch; chunks are ≤ output cap but a single batch is
+    // capped at BATCH_BYTES growth boundaries well under UNIX DATAGRAM limits.
+    sock.send_to(buf, dest).await?;
+    Ok(())
 }

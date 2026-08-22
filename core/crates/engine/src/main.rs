@@ -3,12 +3,11 @@
 //! and writes [`Response`]s back on stdout. Raw stdout/stderr of the user's
 //! code rides a separate SOCK_SEQPACKET data channel
 
-use clap::Parser;
 use engine::{App, Args};
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    let args = Args::parse_from_env();
     let app = App::init(args)?;
     app.run().await
 }
