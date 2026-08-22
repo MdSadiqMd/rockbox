@@ -44,6 +44,8 @@ where
                 limit: MAX_FRAME_BYTES,
             });
         }
+        // Payload reads are bounded to exactly `len` so a pipe that already
+        // holds the next frame's bytes is never over-read.
         self.buf.clear();
         self.buf.resize(len, 0);
         self.reader
@@ -81,14 +83,15 @@ where
                 limit: MAX_FRAME_BYTES,
             });
         }
-        // Length prefix + payload in two writes under one lock hold: no
-        // intermediate scratch buffer, no full-frame memcpy.
-        let len = (payload.len() as u32).to_be_bytes();
+        // Length prefix + payload land in one write so the pipe sees a single
+        // contiguous frame (one syscall instead of two).
+        let mut frame = Vec::with_capacity(payload.len() + 4);
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
         let mut w = self.inner.lock().await;
-        w.write_all(&len).await.map_err(io_err)?;
-        w.write_all(&payload).await.map_err(io_err)?;
+        w.write_all(&frame).await.map_err(io_err)?;
         w.flush().await.map_err(io_err)?;
-        trace!(bytes = payload.len() + 4, "frame_out");
+        trace!(bytes = frame.len(), "frame_out");
         Ok(())
     }
 }

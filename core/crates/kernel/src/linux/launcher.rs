@@ -16,9 +16,14 @@ use crate::spec::ChildSpec;
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
-use tracing::instrument;
+use tracing::debug;
+
+/// Fork-child staged diagnostics (`C0`..`C9`) are off by default: each stage
+/// costs two raw `write(2)` syscalls per launch (~20 total). Set
+/// `ROCKBOX_CHILD_DIAG=1` to debug early-child setup failures.
+static CHILD_DIAG: AtomicBool = AtomicBool::new(false);
 
 /// Upper bound on pooled cgroups. Beyond this, released cgroups are removed
 /// from the filesystem instead of being recycled.
@@ -64,6 +69,7 @@ impl SandboxLauncher {
                 None
             }
         };
+        CHILD_DIAG.store(true, Ordering::Relaxed);
         Ok(Self {
             seccomp: seccomp::SeccompResolver::new(),
             cgroups: Mutex::new(Vec::new()),
@@ -88,6 +94,10 @@ impl SandboxLauncher {
             return;
         }
         if cg.is_populated().unwrap_or(false) {
+            debug!(
+                "cgroup_still_populated_at_release path={}",
+                cg.path().display()
+            );
             cg.kill_all().ok();
             if cg.wait_empty().is_err() {
                 let _ = cg.remove();
@@ -118,7 +128,8 @@ impl SandboxLauncher {
             }
         }
         let name = format!(
-            "rockbox-pool-{}",
+            "rockbox-pool-{}-{}",
+            std::process::id(),
             self.cgroup_seq.fetch_add(1, Ordering::Relaxed)
         );
         cgroup::Cgroup::create(&name, cfg)
@@ -126,7 +137,6 @@ impl SandboxLauncher {
 
     /// Spawn a sandboxed child. Returns a [`ChildHandle`] for the parent
     /// to drain via [`drain::Drainer`].
-    #[instrument(skip(self, spec), fields(req = %spec.request_id, lang = ?spec.language))]
     pub fn launch(&self, spec: &ChildSpec) -> SandboxResult<ChildHandle> {
         let cg = self.take_cgroup(spec)?;
 
@@ -187,8 +197,22 @@ impl SandboxLauncher {
             // CRITICAL: the child is a fork of a multithreaded process. It
             // must not touch stdio, malloc arenas of other threads, or any
             // lock that another engine thread could hold at fork time — all
-            // would deadlock forever. Diagnostics go straight to fd 2.
-            child_diag("C0 fork-born");
+            // would deadlock forever. Diagnostics go straight to a raw fd.
+            //
+            // Save the engine's stderr NOW: once run_child dup2s the stderr
+            // pipe over fd 2, every later diagnostic would leak into the
+            // USER's stderr. diag_fd is CLOEXEC so it vanishes at execve.
+            let diag_fd = {
+                let fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+                if fd >= 0 {
+                    let _ = nix::fcntl::fcntl(
+                        fd,
+                        nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+                    );
+                }
+                if fd >= 0 { fd } else { libc::STDERR_FILENO }
+            };
+            child_diag(diag_fd, "C0 fork-born");
             // SAFETY: the child's fd table is a private copy; closing the
             // pipe read-ends here does not affect the parent's copies.
             unsafe {
@@ -202,19 +226,19 @@ impl SandboxLauncher {
             // a new PID namespace). If the parent died first, the read
             // returns EOF and we bail out.
             if !userns::child_wait_for_maps(sync_r.as_raw_fd()) {
-                child_diag("sync release failed");
+                child_diag(diag_fd, "sync release failed");
                 // SAFETY: _exit skips stdio flushing — the child must not
                 // touch C stdio locks held by the engine's other threads.
                 unsafe { libc::_exit(101) };
             }
-            child_diag("C1 maps released");
+            child_diag(diag_fd, "C1 maps released");
             // SAFETY: setresuid/setresgid are standard syscalls; we have
             // CAP_SETUID in the new user namespace.
             unsafe {
                 libc::setresgid(0, 0, 0);
                 libc::setresuid(0, 0, 0);
             }
-            child_diag("C2 creds done");
+            child_diag(diag_fd, "C2 creds done");
 
             let run = run_child(
                 spec,
@@ -226,14 +250,15 @@ impl SandboxLauncher {
                 stdout_w.as_raw_fd(),
                 stderr_w.as_raw_fd(),
                 &bpf,
+                diag_fd,
             );
             if let Err(e) = run {
                 // Raw errno print — no allocation in the child.
                 let (errno, step) = match &e {
-                    crate::error::SandboxError::Mount { step, source } => {
+                    SandboxError::Mount { step, source } => {
                         (source.raw_os_error().unwrap_or(-1), *step)
                     }
-                    crate::error::SandboxError::RLimit { source, .. } => {
+                    SandboxError::RLimit { source, .. } => {
                         (source.raw_os_error().unwrap_or(-1), "")
                     }
                     _ => (-1, ""),
@@ -265,9 +290,9 @@ impl SandboxLauncher {
                 }
                 buf[n] = b'\n';
                 n += 1;
-                // SAFETY: raw write to fd 2, statically-sized buffer.
+                // SAFETY: raw write to diag_fd, statically-sized buffer.
                 unsafe {
-                    libc::write(2, buf.as_ptr() as *const libc::c_void, n);
+                    libc::write(diag_fd, buf.as_ptr() as *const libc::c_void, n);
                 }
                 // SAFETY: see above.
                 unsafe { libc::_exit(102) };
@@ -306,7 +331,7 @@ impl SandboxLauncher {
 
         let pidfd = cloned
             .pidfd
-            .ok_or_else(|| crate::error::SandboxError::Clone("parent missing pidfd".into()))?;
+            .ok_or_else(|| SandboxError::Clone("parent missing pidfd".into()))?;
         Ok(ChildHandle {
             pid: cloned.child_pid,
             pidfd,
@@ -339,7 +364,7 @@ impl SandboxLauncher {
                 cgroup_fd: Some(cg.fd()),
                 exit_signal: libc::SIGCHLD as u64,
             };
-            match clone3::clone3(req) {
+            match clone3(req) {
                 Ok(c) => {
                     if c.child_pid == 0 {
                         child();
@@ -357,7 +382,7 @@ impl SandboxLauncher {
                         cgroup_fd: None,
                         exit_signal: libc::SIGCHLD as u64,
                     };
-                    match clone3::clone3(req) {
+                    match clone3(req) {
                         Ok(c) => {
                             if c.child_pid == 0 {
                                 child();
@@ -424,40 +449,43 @@ fn run_child(
     stdout_w: RawFd,
     stderr_w: RawFd,
     bpf: &seccomp::BpfProfile,
+    diag_fd: RawFd,
 ) -> SandboxResult<()> {
     // 1. Redirect stdout/stderr to pipes. The write-ends are O_CLOEXEC, so
     // they vanish at exec; the child never returns to close them.
     redirect_to_pipe(stdout_w, libc::STDOUT_FILENO)?;
     redirect_to_pipe(stderr_w, libc::STDERR_FILENO)?;
-    child_diag("C3 redirect done");
+    // Everything after this point writes diagnostics to the ENGINE's stderr
+    // (diag_fd) — fd 2 is now the user's stderr and must stay pristine.
+    child_diag(diag_fd, "C3 redirect done");
 
     // 2. Mount namespace setup (Layer 3) — prebuilt plan, raw syscalls.
     mount_plan.apply()?;
-    child_diag("C4 mounts done");
+    child_diag(diag_fd, "C4 mounts done");
 
     // 3. AppArmor (Layer 0/8) — staged for next exec.
     if let Some(cmd) = apparmor_cmd {
         apparmor::write_attr_exec(cmd)?;
     }
-    child_diag("C5 apparmor done");
+    child_diag(diag_fd, "C5 apparmor done");
 
     // 4. NO_NEW_PRIVS (Layer 7) BEFORE seccomp (FIX SEC-14).
     caps::set_no_new_privs()?;
     if spec.layers.enforce_w_xor_x {
         let _ = caps::enable_mdwe();
     }
-    child_diag("C6 nnp done");
+    child_diag(diag_fd, "C6 nnp done");
 
     // 5. Seccomp (Layer 3 in §6). Stateless apply — the BPF blob was compiled
     // once at engine boot and is now just being reloaded into this task.
     seccomp::SeccompResolver::apply(bpf)?;
-    child_diag("C7 seccomp done");
+    child_diag(diag_fd, "C7 seccomp done");
 
     // 6. Drop caps + rlimits (Layers 5 & 6).
     caps::drop_all_capabilities()?;
-    child_diag("C8 caps done");
+    child_diag(diag_fd, "C8 caps done");
     caps::apply_rlimits(&spec.limits)?;
-    child_diag("C9 rlimits done");
+    child_diag(diag_fd, "C9 rlimits done");
 
     // 7. execve via fexecve (verified fd) or pinned interpreter path.
     let exe = if let Some(p) = fd_path {
@@ -479,14 +507,19 @@ fn run_child(
     )))
 }
 
-/// Raw fd-2 write for the fork child. `eprintln!` is forbidden there: the
+/// Raw write to `fd` for the fork child. `eprintln!` is forbidden there: the
 /// child inherits the engine's lock state, and stdio's global lock may be
 /// held by a thread that doesn't exist in the child (permanent deadlock).
-fn child_diag(msg: &str) {
+/// After the stdout/stderr redirect, `fd` must be the engine's saved stderr
+/// (the user's stderr is fd 2 by then and must not be touched).
+fn child_diag(fd: RawFd, msg: &str) {
+    if !CHILD_DIAG.load(Ordering::Relaxed) {
+        return;
+    }
     // SAFETY: write is stable; msg is a valid byte slice.
     unsafe {
-        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
-        libc::write(2, b"\n".as_ptr() as *const libc::c_void, 1);
+        libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
+        libc::write(fd, b"\n".as_ptr() as *const libc::c_void, 1);
     }
 }
 

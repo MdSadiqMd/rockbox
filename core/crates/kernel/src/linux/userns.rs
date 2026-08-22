@@ -10,7 +10,7 @@
 //!
 //! The child's first act is a blocking read on the sync pipe; everything it
 //! does after that (mounts, chown, creds reset) requires the maps to exist.
-use crate::error::{SandboxError, SandboxResult};
+use crate::error::SandboxResult;
 
 /// Outside-uid the engine maps the in-namespace root to.
 pub const NOBODY_UID: u32 = 65534;
