@@ -6,11 +6,10 @@ use crate::state::EngineState;
 use anyhow::{Context, Result};
 use msgpack::FrameWriter;
 use protocol::{Response, ResultStatus, Settings};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::io::Stdout;
-use tracing::{info, instrument};
+use tokio::io::AsyncWrite;
+use tracing::debug;
 
 /// Accumulate a stream's bytes with a caller-supplied cap; the single lossy
 /// UTF-8 conversion happens once, after the last chunk, instead of per chunk.
@@ -47,11 +46,10 @@ impl ByteCap {
     }
 }
 
-#[instrument(skip(state, settings, writer, data), fields(req = %settings.request_id))]
-pub async fn run(
+pub async fn run<W: AsyncWrite + Unpin>(
     state: &EngineState,
     settings: Settings,
-    writer: &FrameWriter<Stdout>,
+    writer: &FrameWriter<W>,
     data: Option<&DataChannel>,
 ) -> Result<()> {
     let request_id = settings.request_id.clone();
@@ -65,84 +63,87 @@ pub async fn run(
         }
     };
     let binary_cache = state.binary_cache.clone();
-    let output_bytes = settings.limits.output_bytes;
-    let cap = output_bytes as usize;
+    let output_bytes_cap = settings.limits.output_bytes;
+    let cap = output_bytes_cap as usize;
     let stream_enabled = settings.output.stream;
+    // Owned handle so the drain closure can stream without borrowing.
+    let data_owned = data.cloned();
 
     let start = Instant::now();
 
-    // Resolve + launch run on a blocking thread: a cold compile or the
-    // mount-namespace setup can take milliseconds, and the async worker must
-    // stay free to service Stdin/Interrupt frames and the data channel.
-    let handle = {
+    // Resolve, launch, and drain all run on ONE blocking thread. Every extra
+    // hop (a second spawn_blocking dispatch, an mpsc channel, an aggregator
+    // task wakeup) is pure scheduler latency on the request path; the
+    // callbacks here are cheap (buffer append + optional queue push), so the
+    // async side has nothing to do until the child exits.
+    let joined = {
         let launcher = launcher.clone();
-        let resolve = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let t = Instant::now();
             let resolved = resolver_spec::resolve(&settings, work_root, Some(&binary_cache))
                 .context("resolve spec")?;
             let resolve_ms = t.elapsed().as_millis() as u64;
+            tracing::debug!(?resolved.spec, "spec_for_launch");
             let t = Instant::now();
             let handle = launcher.launch(&resolved.spec).context("launch")?;
-            Ok::<_, anyhow::Error>((handle, resolve_ms, t.elapsed().as_millis() as u64))
-        });
-        resolve.await.context("resolve/launch join")??
-    };
-    let (handle, resolve_ms, launch_ms) = handle;
-    let (cg, mut drainer) = launcher
-        .make_drainer(handle, output_bytes)
-        .context("make_drainer")?;
-    let drain_start = Instant::now();
+            let launch_ms = t.elapsed().as_millis() as u64;
+            let (cg, mut drainer) = launcher
+                .make_drainer(handle, output_bytes_cap)
+                .context("make_drainer")?;
+            let drain_start = Instant::now();
 
-    // Chunks flow: blocking drainer → unbounded channel → async aggregator.
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<(Stream, Vec<u8>)>();
-    let output_bytes = Arc::new(AtomicU64::new(0));
-    let counter = output_bytes.clone();
+            let mut output = ByteCap::new(cap);
+            let mut errors = ByteCap::new(cap);
+            let sent = AtomicU64::new(0);
 
-    let blocking = tokio::task::spawn_blocking(move || {
-        let tx_out = chunk_tx.clone();
-        let tx_err = chunk_tx.clone();
-        let on_stdout = move |chunk: &[u8]| {
-            counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            let _ = tx_out.send((Stream::Stdout, chunk.to_vec()));
-        };
-        let on_stderr = move |chunk: &[u8]| {
-            let _ = tx_err.send((Stream::Stderr, chunk.to_vec()));
-        };
-        let res = drainer.run(&cg, on_stdout, on_stderr);
-        // Dropping `chunk_tx` closes the channel so the aggregator exits.
-        drop(chunk_tx);
-        res.map(|exit| (cg, exit))
-    });
+            let on_stdout = |chunk: &[u8]| {
+                sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                output.extend(chunk);
+                if stream_enabled {
+                    if let Some(d) = &data_owned {
+                        d.send(Stream::Stdout, chunk.to_vec());
+                    }
+                }
+            };
+            let on_stderr = |chunk: &[u8]| {
+                sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                errors.extend(chunk);
+                if stream_enabled {
+                    if let Some(d) = &data_owned {
+                        d.send(Stream::Stderr, chunk.to_vec());
+                    }
+                }
+            };
 
-    // Aggregator runs concurrently; consumes until the channel closes.
-    // Output is captured up to the user-configured `output_bytes` cap so we
-    // can always return it on the control channel — the data channel is a
-    // streaming optimisation, not the source of truth.
-    let mut output = ByteCap::new(cap);
-    let mut errors = ByteCap::new(cap);
-    while let Some((stream, bytes)) = chunk_rx.recv().await {
-        match stream {
-            Stream::Stdout => output.extend(&bytes),
-            Stream::Stderr => errors.extend(&bytes),
-        }
-        if stream_enabled {
-            if let Some(d) = data {
-                d.send(stream, bytes);
-            }
-        }
-    }
-
-    let (cg_exit, child_exit) = blocking
+            let exit = drainer.run(&cg, on_stdout, on_stderr).context("drain")?;
+            let drain_ms = drain_start.elapsed().as_millis() as u64;
+            Ok::<_, anyhow::Error>((
+                cg,
+                exit,
+                output,
+                errors,
+                sent.into_inner(),
+                resolve_ms,
+                launch_ms,
+                drain_ms,
+            ))
+        })
         .await
-        .context("drainer join")?
-        .context("drainer run")?;
+        .context("resolve/launch/drain join")??
+    };
+    let (cg, child_exit, output, errors, output_total, resolve_ms, launch_ms, drain_ms) = joined;
     let exec_ms = start.elapsed().as_millis() as u64;
-    let drain_ms = drain_start.elapsed().as_millis() as u64;
-    let mem_peak = cg_exit.current_memory_peak().unwrap_or(0) / (1024 * 1024);
-    launcher.release_cgroup(cg_exit);
+
+    // The drainer already read the cgroup peak for a Normal exit; don't
+    // re-read /proc for the common path.
+    let mem_peak = match &child_exit {
+        kernel::ChildExit::Normal { memory_peak_mb, .. } => *memory_peak_mb,
+        _ => cg.current_memory_peak().unwrap_or(0) / (1024 * 1024),
+    };
+    launcher.release_cgroup(cg);
 
     let (status, exit_code) = map_status(&child_exit);
-    info!(
+    debug!(
         ?child_exit,
         exec_ms, resolve_ms, launch_ms, drain_ms, "exec_done"
     );
@@ -155,7 +156,7 @@ pub async fn run(
             exec_time_ms: exec_ms,
             memory_peak_mb: mem_peak,
             cpu_time_ms: 0,
-            output_bytes: output_bytes.load(Ordering::Relaxed),
+            output_bytes: output_total,
             output_truncated: matches!(status, ResultStatus::OutputExceeded),
             output: output.into_lossy_string(),
             errors: errors.into_lossy_string(),

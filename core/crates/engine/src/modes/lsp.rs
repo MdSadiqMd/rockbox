@@ -23,7 +23,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::Stdout;
+use tokio::io::AsyncWrite;
 use tracing::{info, warn};
 
 /// A running language server. `stdin` is protected by a mutex — we can only
@@ -233,10 +233,10 @@ fn resolve_server(language: Language) -> Result<(String, Vec<String>)> {
     ))
 }
 
-pub async fn relay(
+pub async fn relay<W: AsyncWrite + Unpin>(
     state: &EngineState,
     params: LspParams,
-    writer: &FrameWriter<Stdout>,
+    writer: &FrameWriter<W>,
 ) -> Result<()> {
     let start = Instant::now();
     let Some(language) = state.language() else {

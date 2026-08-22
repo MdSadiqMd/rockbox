@@ -12,7 +12,7 @@ use msgpack::FrameWriter;
 use protocol::{Mode, Response, Settings};
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use tokio::io::Stdout;
+use tokio::io::AsyncWrite;
 
 pub mod exec;
 pub mod lsp;
@@ -30,10 +30,10 @@ pub fn work_root() -> &'static PathBuf {
     })
 }
 
-pub async fn dispatch(
+pub async fn dispatch<W: AsyncWrite + Unpin>(
     state: &EngineState,
     settings: Settings,
-    writer: &FrameWriter<Stdout>,
+    writer: &FrameWriter<W>,
     data: Option<&DataChannel>,
 ) -> Result<()> {
     // Any request updates the engine's active-language slot so LSP relays,
@@ -49,7 +49,11 @@ pub async fn dispatch(
 
 /// Helper: emit an `EngineDied` response and abort the loop. Used by mode
 /// handlers when something irrecoverable happens (e.g. cgroup setup failed).
-pub async fn die(writer: &FrameWriter<Stdout>, reason: &str, detail: impl Into<Option<String>>) {
+pub async fn die<W: AsyncWrite + Unpin>(
+    writer: &FrameWriter<W>,
+    reason: &str,
+    detail: impl Into<Option<String>>,
+) {
     let _ = writer
         .write(&Response::EngineDied(protocol::EngineDeath {
             reason: reason.into(),

@@ -35,7 +35,7 @@ use serde::Deserialize;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Instant;
-use tokio::io::Stdout;
+use tokio::io::AsyncWrite;
 use tracing::{info, instrument, warn};
 
 const SESSIONS_ROOT: &str = "/var/lib/sandbox/sessions";
@@ -45,10 +45,10 @@ const SHIM_FILENAME_JS: &str = ".rockbox_session_shim.mjs";
 const CELL_FILENAME: &str = ".rockbox_cell";
 
 #[instrument(skip(state, settings, writer, _data), fields(req = %settings.request_id))]
-pub async fn start_or_attach(
+pub async fn start_or_attach<W: AsyncWrite + Unpin>(
     state: &EngineState,
     settings: Settings,
-    writer: &FrameWriter<Stdout>,
+    writer: &FrameWriter<W>,
     _data: Option<&DataChannel>,
 ) -> Result<()> {
     let session_id = settings
@@ -120,7 +120,7 @@ pub async fn start_or_attach(
 
 #[allow(clippy::too_many_arguments)]
 #[instrument(skip(state, code, files, _stdin, writer, data), fields(req = %id, session = %session_id))]
-pub async fn run_cell(
+pub async fn run_cell<W: AsyncWrite + Unpin>(
     state: &EngineState,
     id: String,
     session_id: String,
@@ -128,7 +128,7 @@ pub async fn run_cell(
     files: Vec<FileEntry>,
     _stdin: Option<String>,
     wall_ms: Option<u64>,
-    writer: &FrameWriter<Stdout>,
+    writer: &FrameWriter<W>,
     data: Option<&DataChannel>,
 ) -> Result<()> {
     let start = Instant::now();
@@ -310,9 +310,6 @@ async fn run_exec_pipeline(
     // We can't fully piggyback on modes::exec::run because it writes a
     // Result frame — we want the shim's structured output on a CellResult
     // frame instead. So we duplicate the tight loop but discard the frame.
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-
     let work_root = crate::modes::work_root();
     let launcher = state
         .launcher
@@ -322,51 +319,43 @@ async fn run_exec_pipeline(
     let binary_cache = state.binary_cache.clone();
     let output_bytes = settings.limits.output_bytes;
     let stream_enabled = settings.output.stream;
+    let data_owned = data.cloned();
 
-    let handle = {
+    // Resolve, launch, and drain on ONE blocking thread — same shape as
+    // exec mode; extra hops only add scheduler latency to every cell.
+    let joined = {
         let launcher = launcher.clone();
-        let resolve = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let resolved = resolver_spec::resolve(&settings, work_root, Some(&binary_cache))
                 .context("resolve spec")?;
-            launcher.launch(&resolved.spec).context("launch")
-        });
-        resolve.await.context("resolve/launch join")??
-    };
-    let (cg, mut drainer) = launcher
-        .make_drainer(handle, output_bytes)
-        .context("make_drainer")?;
+            let handle = launcher.launch(&resolved.spec).context("launch")?;
+            let (cg, mut drainer) = launcher
+                .make_drainer(handle, output_bytes)
+                .context("make_drainer")?;
 
-    let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::unbounded_channel::<(Stream, Vec<u8>)>();
-    let output_bytes = Arc::new(AtomicU64::new(0));
-    let counter = output_bytes.clone();
+            let on_stdout = |chunk: &[u8]| {
+                if stream_enabled {
+                    if let Some(d) = &data_owned {
+                        d.send(Stream::Stdout, chunk.to_vec());
+                    }
+                }
+            };
+            let on_stderr = |chunk: &[u8]| {
+                if stream_enabled {
+                    if let Some(d) = &data_owned {
+                        d.send(Stream::Stderr, chunk.to_vec());
+                    }
+                }
+            };
 
-    let blocking = tokio::task::spawn_blocking(move || {
-        let tx_out = chunk_tx.clone();
-        let tx_err = chunk_tx.clone();
-        let on_stdout = move |chunk: &[u8]| {
-            counter.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let _ = tx_out.send((Stream::Stdout, chunk.to_vec()));
-        };
-        let on_stderr = move |chunk: &[u8]| {
-            let _ = tx_err.send((Stream::Stderr, chunk.to_vec()));
-        };
-        let res = drainer.run(&cg, on_stdout, on_stderr);
-        drop(chunk_tx);
-        res.map(|exit| (cg, exit))
-    });
-
-    while let Some((stream, bytes)) = chunk_rx.recv().await {
-        if stream_enabled {
-            if let Some(d) = data {
-                d.send(stream, bytes);
-            }
-        }
-    }
-
-    let (cg, _child_exit) = blocking
+            let exit = drainer.run(&cg, on_stdout, on_stderr).context("drain")?;
+            Ok::<_, anyhow::Error>((cg, exit))
+        })
         .await
-        .context("drainer join")?
-        .context("drainer run")?;
+        .context("resolve/launch/drain join")??
+    };
+
+    let (cg, _child_exit) = joined;
     launcher.release_cgroup(cg);
     Ok(())
 }
@@ -424,7 +413,7 @@ fn python_shim() -> &'static str {
     static SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SHIM.get_or_init(|| {
         format!(
-            r#"import os, sys, json, io, traceback, pickle
+            r#"import os, sys, json, pickle
 
 STATE_PATH = "/session/state.pkl"
 RESULT_PATH = "/session/{result_file}"
@@ -458,6 +447,7 @@ except SystemExit as e:
             "traceback": f"SystemExit({{e.code}})",
         }}
 except BaseException:
+    import traceback  # lazy: only the error path pays for this import
     result = {{
         "status": "error",
         "value_repr": None,
