@@ -26,7 +26,7 @@ defmodule Rockbox.Settings.Defaults do
   def mode_defaults(:exec),
     do: %{
       limits: %{wall_ms: 5_000, memory_mb: 512, output_bytes: 2 * 1024 * 1024},
-      lifecycle: %{idle_ttl_s: 0, auto_destroy: true}
+      lifecycle: %{idle_ttl_s: 600, auto_destroy: true}
     }
 
   def mode_defaults(:session),

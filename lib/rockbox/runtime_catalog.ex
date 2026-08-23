@@ -45,6 +45,17 @@ defmodule Rockbox.RuntimeCatalog do
       description: "Node 22 + tsx + zod + axios + drizzle."
     },
     %Entry{
+      name: "ts-bun",
+      language: :typescript,
+      baseline_caps: ["concurrency"],
+      baseline_env: %{
+        "BUN_INSTALL" => "/tmp/.bun",
+        "XDG_CACHE_HOME" => "/tmp/.cache",
+        "LANG" => "C.UTF-8"
+      },
+      description: "Bun 1.3 — native TypeScript, ~0.6ms boot (vs node ~13ms)."
+    },
+    %Entry{
       name: "go-std",
       language: :go,
       baseline_caps: ["concurrency"],

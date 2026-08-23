@@ -48,11 +48,17 @@ defmodule Rockbox.Telemetry do
       counter("rockbox.webhook.sent.count", tags: [:event]),
       counter("rockbox.webhook.failed.count", tags: [:event, :reason]),
 
-      # Phoenix
-      summary("phoenix.endpoint.stop.duration", unit: {:native, :millisecond}),
-      summary("phoenix.router_dispatch.stop.duration",
+      # Phoenix. `distribution`, not `summary`: the Prometheus core reporter
+      # has no summary support and logs a drop-warning per event (i.e. twice
+      # per request) when handed one.
+      distribution("phoenix.endpoint.stop.duration",
         unit: {:native, :millisecond},
-        tags: [:route]
+        reporter_options: [buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 50, 100]]
+      ),
+      distribution("phoenix.router_dispatch.stop.duration",
+        unit: {:native, :millisecond},
+        tags: [:route],
+        reporter_options: [buckets: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 50, 100]]
       )
     ]
   end

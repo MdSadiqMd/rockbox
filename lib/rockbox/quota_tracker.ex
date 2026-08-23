@@ -21,10 +21,33 @@ defmodule Rockbox.QuotaTracker do
   @doc """
   Try to reserve a VM slot. Returns `:ok` if under the cap, `{:error,
   :concurrency_exceeded}` otherwise. Caller MUST balance with [`release/1`].
-  """
-  def reserve(workspace_id), do: GenServer.call(__MODULE__, {:reserve, workspace_id})
 
-  def release(workspace_id), do: GenServer.call(__MODULE__, {:release, workspace_id})
+  Lock-free: the counter is bumped with `:ets.update_counter`, which is
+  atomic per key, so no GenServer round-trip is needed on this hot path.
+  """
+  def reserve(workspace_id) do
+    cap = workspace_cap(workspace_id)
+
+    current =
+      :ets.update_counter(
+        @table,
+        {:in_flight, workspace_id},
+        {2, 1},
+        {{:in_flight, workspace_id}, 0}
+      )
+
+    if current > cap do
+      :ets.update_counter(@table, {:in_flight, workspace_id}, {2, -1})
+      {:error, :concurrency_exceeded}
+    else
+      :ok
+    end
+  end
+
+  def release(workspace_id) do
+    :ets.update_counter(@table, {:in_flight, workspace_id}, {2, -1, 0, 0})
+    :ok
+  end
 
   @doc "Returns `:ok` if the bucket has tokens, `{:error, :rate_limited}` otherwise."
   def take_token(workspace_id), do: GenServer.call(__MODULE__, {:take, workspace_id})
@@ -43,18 +66,6 @@ defmodule Rockbox.QuotaTracker do
   end
 
   @impl true
-  def handle_call({:reserve, wid}, _from, state) do
-    cap = workspace_cap(wid)
-    current = :ets.update_counter(@table, {:in_flight, wid}, {2, 1}, {{:in_flight, wid}, 0})
-
-    if current > cap do
-      :ets.update_counter(@table, {:in_flight, wid}, {2, -1})
-      {:reply, {:error, :concurrency_exceeded}, state}
-    else
-      {:reply, :ok, state}
-    end
-  end
-
   def handle_call({:take, wid}, _from, state) do
     now = System.monotonic_time(:millisecond)
     {tokens_max, tokens_per_s} = bucket_config(wid)
@@ -70,12 +81,6 @@ defmodule Rockbox.QuotaTracker do
         {:reply, {:error, :rate_limited},
          %{state | buckets: Map.put(state.buckets, wid, new_bucket)}}
     end
-  end
-
-  @impl true
-  def handle_call({:release, wid}, _from, state) do
-    :ets.update_counter(@table, {:in_flight, wid}, {2, -1, 0, 0})
-    {:reply, :ok, state}
   end
 
   defp workspace_cap(_wid) do

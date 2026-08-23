@@ -44,6 +44,7 @@ defmodule Rockbox.VM.Server do
       :session_id,
       :port,
       :data_sock,
+      :data_sock_path,
       :status,
       :started_at,
       :owner,
@@ -58,6 +59,14 @@ defmodule Rockbox.VM.Server do
 
   @doc "Send `mode=exec` with the given frozen settings."
   def execute(vm_id, %Effective{} = s), do: call(vm_id, {:execute, s})
+
+  @doc """
+  Send `mode=exec` and block until `Response::Result` for that request
+  arrives. The controller's wait is a direct `GenServer.reply` instead of a
+  PubSub subscribe + broadcast round-trip.
+  """
+  def execute_and_wait(vm_id, %Effective{} = s, timeout),
+    do: call(vm_id, {:execute_and_wait, s}, timeout)
 
   @doc "Send an `exec_cell` command (session mode)."
   def exec_cell(vm_id, cell), do: call(vm_id, {:exec_cell, cell})
@@ -84,6 +93,7 @@ defmodule Rockbox.VM.Server do
         try do
           GenServer.call(pid, msg, timeout)
         catch
+          :exit, {:timeout, _} -> {:error, :timeout}
           :exit, _ -> {:error, :vm_down}
         end
 
@@ -131,6 +141,7 @@ defmodule Rockbox.VM.Server do
           session_id: session_id,
           port: port,
           data_sock: data_sock,
+          data_sock_path: sock_path,
           status: :booting,
           started_at: System.system_time(:millisecond),
           owner: Map.get(opts, :owner),
@@ -154,6 +165,13 @@ defmodule Rockbox.VM.Server do
     Port.command(state.port, Msgpax.pack!(payload, iodata: true))
     pending = Map.put(state.pending, s.request_id, {:execute, s})
     {:reply, :ok, %{state | status: :running, pending: pending}}
+  end
+
+  def handle_call({:execute_and_wait, %Effective{} = s}, from, state) do
+    payload = Map.merge(%{"cmd" => "execute"}, Effective.to_wire(s))
+    Port.command(state.port, Msgpax.pack!(payload, iodata: true))
+    pending = Map.put(state.pending, s.request_id, {:wait, from})
+    {:noreply, %{state | status: :running, pending: pending}}
   end
 
   def handle_call({:exec_cell, %{} = cell}, _from, state) do
@@ -201,6 +219,13 @@ defmodule Rockbox.VM.Server do
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
     Logger.warning("[vm #{state.vm_id}] engine exit_status=#{status}")
     Phoenix.PubSub.broadcast(Rockbox.PubSub, "vm:#{state.vm_id}", {:engine_died, status})
+
+    Enum.each(state.pending, fn
+      {_request_id, {:wait, from}} -> GenServer.reply(from, {:error, %{engine_died: status}})
+      _ -> :ok
+    end)
+
+    notify_pool_dead(state)
     {:stop, {:engine_exit, status}, state}
   end
 
@@ -225,8 +250,29 @@ defmodule Rockbox.VM.Server do
 
   @impl true
   def terminate(_reason, state) do
+    notify_pool_dead(state)
     if state.data_sock, do: :gen_udp.close(state.data_sock)
+
+    case Map.fetch(state, :data_sock_path) do
+      {:ok, path} when is_binary(path) -> File.rm(path)
+      :error -> :ok
+    end
+
     :ok
+  end
+
+  # Idempotent: Pool.Manager's `:vm_dead` handler only releases the quota
+  # slot when the VM is still tracked as `:busy`, so a duplicate notification
+  # (exit_status + terminate) or one arriving after a retire/destroy is a no-op.
+  defp notify_pool_dead(state) do
+    case Process.whereis(Rockbox.Pool.Manager) do
+      nil ->
+        :ok
+
+      pid ->
+        GenServer.cast(pid, {:vm_dead, state.vm_id, state.workspace_id})
+        :ok
+    end
   end
 
   defp handle_response(%{"type" => "ready"} = msg, state) do
@@ -240,8 +286,14 @@ defmodule Rockbox.VM.Server do
     record_audit(state, msg)
     emit_webhook(state, "completed", msg)
 
-    new_pending = Map.delete(state.pending, msg["request_id"])
-    %{state | status: :idle, pending: new_pending}
+    case Map.pop(state.pending, msg["request_id"]) do
+      {{:wait, from}, rest} ->
+        GenServer.reply(from, {:ok, msg})
+        %{state | status: :idle, pending: rest}
+
+      {_other, rest} ->
+        %{state | status: :idle, pending: rest}
+    end
   end
 
   defp handle_response(%{"type" => "cell_result"} = msg, state) do
@@ -279,7 +331,17 @@ defmodule Rockbox.VM.Server do
     File.mkdir_p!(data_sock_dir())
     path = Path.join(data_sock_dir(), "#{vm_id}.sock")
     _ = File.rm(path)
-    {:ok, sock} = :gen_udp.open(0, [:binary, {:active, :once}, {:reuseaddr, true}])
+
+    # Bind a UNIX-domain DGRAM socket to the path — the engine sends framed
+    # stdout/stderr chunks here via UnixDatagram. An unbound socket would
+    # leave the path nonexistent and every engine connect fails.
+    {:ok, sock} =
+      :gen_udp.open(0, [
+        :binary,
+        {:active, :once},
+        {:ip, {:local, String.to_charlist(path)}}
+      ])
+
     {sock, path}
   end
 

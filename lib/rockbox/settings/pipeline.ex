@@ -59,7 +59,7 @@ defmodule Rockbox.Settings.Pipeline do
     do: {:ok, id}
 
   defp ensure_request_id(_s, _ctx) do
-    id = ("req_" <> :crypto.strong_rand_bytes(8)) |> Base.encode16(case: :lower)
+    id = "req_" <> (:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower))
     {:ok, id}
   end
 
