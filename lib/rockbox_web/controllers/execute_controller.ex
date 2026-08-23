@@ -49,13 +49,22 @@ defmodule RockboxWeb.ExecuteController do
   end
 
   defp run_and_reply(conn, %Effective{} = eff) do
+    timeout = (eff.limits["wall_ms"] || 5_000) + 5_000
+
     case Pool.acquire(eff) do
       {:ok, vm_id} ->
-        Phoenix.PubSub.subscribe(Rockbox.PubSub, "vm:#{vm_id}")
+        case VM.Server.execute_and_wait(vm_id, eff, timeout) do
+          {:ok, result} ->
+            Pool.release(vm_id, eff)
+            json(conn, build_response(eff, vm_id, result))
 
-        case VM.Server.execute(vm_id, eff) do
-          :ok ->
-            wait_for_result(conn, vm_id, eff)
+          {:error, %{engine_died: status}} ->
+            Pool.release(vm_id, eff)
+            conn |> put_status(500) |> json(%{error: "engine_died", info: status})
+
+          {:error, :timeout} ->
+            Pool.release(vm_id, eff)
+            conn |> put_status(504) |> json(%{error: "timeout"})
 
           {:error, reason} ->
             Pool.release(vm_id, eff)
@@ -67,24 +76,6 @@ defmodule RockboxWeb.ExecuteController do
 
       {:error, reason} ->
         conn |> put_status(500) |> json(%{error: "acquire_failed", reason: inspect(reason)})
-    end
-  end
-
-  defp wait_for_result(conn, vm_id, %Effective{} = eff) do
-    timeout = (eff.limits["wall_ms"] || 5_000) + 5_000
-
-    receive do
-      {:result, result} ->
-        Pool.release(vm_id, eff)
-        json(conn, build_response(eff, vm_id, result))
-
-      {:engine_died, info} ->
-        Pool.release(vm_id, eff)
-        conn |> put_status(500) |> json(%{error: "engine_died", info: info})
-    after
-      timeout ->
-        Pool.release(vm_id, eff)
-        conn |> put_status(504) |> json(%{error: "timeout"})
     end
   end
 

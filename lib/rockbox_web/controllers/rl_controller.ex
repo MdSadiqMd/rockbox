@@ -64,9 +64,6 @@ defmodule RockboxWeb.RLController do
 
       {:error, :bad_action} ->
         conn |> put_status(400) |> json(%{error: "action must be base64-encoded bytes"})
-
-      false ->
-        conn |> put_status(400) |> json(%{error: "vm_id required"})
     end
   end
 
