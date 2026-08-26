@@ -36,7 +36,15 @@ pub struct ChildHandle {
     pub cgroup: cgroup::Cgroup,
     pub stdout: OwnedFd,
     pub stderr: OwnedFd,
+    /// Parent's write end of the child's stdin (fd 0). Dropping it signals
+    /// EOF to the child; persistent workers keep it open and stream requests.
+    pub stdin_w: OwnedFd,
+    /// Parent's read end of the child's fd-3 protocol pipe, present when the
+    /// spec asked for `protocol_fd`. Persistent RL workers exchange framed
+    /// request/response messages over it.
+    pub proto_fd: Option<OwnedFd>,
     pub wall: Duration,
+    pub tag: u32,
 }
 
 impl ChildHandle {
@@ -58,6 +66,9 @@ pub struct SandboxLauncher {
     /// Recycled netns template, or `None` when we lack CAP_SYS_ADMIN (then
     /// every launch creates a fresh netns via CLONE_NEWNET as before).
     netns: Option<netns::NetnsTemplate>,
+    /// Monotonic per-launch id used in child diagnostics, so C-stage lines
+    /// from concurrent forks can be attributed after interleaving.
+    launch_seq: AtomicU32,
 }
 
 impl SandboxLauncher {
@@ -69,12 +80,15 @@ impl SandboxLauncher {
                 None
             }
         };
-        CHILD_DIAG.store(true, Ordering::Relaxed);
+        if std::env::var_os("ROCKBOX_CHILD_DIAG").is_some_and(|v| v == "1") {
+            CHILD_DIAG.store(true, Ordering::Relaxed);
+        }
         Ok(Self {
             seccomp: seccomp::SeccompResolver::new(),
             cgroups: Mutex::new(Vec::new()),
             cgroup_seq: AtomicU32::new(0),
             netns,
+            launch_seq: AtomicU32::new(1),
         })
     }
 
@@ -138,11 +152,27 @@ impl SandboxLauncher {
     /// Spawn a sandboxed child. Returns a [`ChildHandle`] for the parent
     /// to drain via [`drain::Drainer`].
     pub fn launch(&self, spec: &ChildSpec) -> SandboxResult<ChildHandle> {
+        // Globally-unique diag id: engine pid mixed with a per-launch seq, so
+        // concurrent engine processes never share tag values in shared logs.
+        let seq = self.launch_seq.fetch_add(1, Ordering::Relaxed) as u64;
+        let tag = (((std::process::id() as u64) << 12) | (seq & 0xFFF)) as u32;
+        debug!(tag, "launch_begin");
         let cg = self.take_cgroup(spec)?;
 
         // Pre-create the pipes BEFORE clone (PERF — avoids post-fork allocation).
         let (stdout_r, stdout_w) = make_pipe()?;
         let (stderr_r, stderr_w) = make_pipe()?;
+        // stdin: the child gets fd 0 from a private pipe. Without this the
+        // child would inherit the ENGINE's stdin (the orchestrator Port) and
+        // any `read()` in user code would steal control-channel bytes.
+        let (stdin_r, stdin_w) = make_pipe()?;
+        // Protocol pipe for persistent workers: parent's read end is handed
+        // to ChildHandle::proto_fd, child's write/read end becomes fd 3.
+        let proto_pipe = if spec.protocol_fd {
+            Some(make_pipe()?)
+        } else {
+            None
+        };
         // Sync pipe: the child blocks on its read end until the parent has
         // written the id maps into /proc/<child>/... (the child cannot write
         // its own maps inside its fresh PID namespace — EPERM).
@@ -212,13 +242,18 @@ impl SandboxLauncher {
                 }
                 if fd >= 0 { fd } else { libc::STDERR_FILENO }
             };
-            child_diag(diag_fd, "C0 fork-born");
+            set_child_name(tag, b"rbc");
+            child_diag(diag_fd, tag, "C0 fork-born");
             // SAFETY: the child's fd table is a private copy; closing the
             // pipe read-ends here does not affect the parent's copies.
             unsafe {
                 libc::close(stdout_r.as_raw_fd());
                 libc::close(stderr_r.as_raw_fd());
+                libc::close(stdin_w.as_raw_fd());
                 libc::close(sync_w.as_raw_fd());
+                if let Some((ref proto_r, _)) = proto_pipe {
+                    libc::close(proto_r.as_raw_fd());
+                }
             }
 
             // Wait for the parent to write our id maps into /proc/<pid>/…
@@ -226,19 +261,27 @@ impl SandboxLauncher {
             // a new PID namespace). If the parent died first, the read
             // returns EOF and we bail out.
             if !userns::child_wait_for_maps(sync_r.as_raw_fd()) {
-                child_diag(diag_fd, "sync release failed");
+                child_diag(diag_fd, tag, "sync release failed");
                 // SAFETY: _exit skips stdio flushing — the child must not
                 // touch C stdio locks held by the engine's other threads.
                 unsafe { libc::_exit(101) };
             }
-            child_diag(diag_fd, "C1 maps released");
+            child_diag(diag_fd, tag, "C1 maps released");
             // SAFETY: setresuid/setresgid are standard syscalls; we have
             // CAP_SETUID in the new user namespace.
+            //
+            // These MUST be raw syscalls, not the libc wrappers: in a fork
+            // of a multithreaded process glibc routes them through the NPTL
+            // setxid broadcast (TCB multiple_threads is inherited true),
+            // which walks the stale thread list and can take another
+            // thread's descriptor lock that was contended at clone time —
+            // deadlocking the child forever before execve. Observed as rare
+            // wall-timeout stalls under load; see docs/competitive_bench.
             unsafe {
-                libc::setresgid(0, 0, 0);
-                libc::setresuid(0, 0, 0);
+                libc::syscall(libc::SYS_setresgid, 0, 0, 0);
+                libc::syscall(libc::SYS_setresuid, 0, 0, 0);
             }
-            child_diag(diag_fd, "C2 creds done");
+            child_diag(diag_fd, tag, "C2 creds done");
 
             let run = run_child(
                 spec,
@@ -247,10 +290,13 @@ impl SandboxLauncher {
                 &mount_plan,
                 apparmor_cmd.as_ref(),
                 fd_path.as_ref(),
+                stdin_r.as_raw_fd(),
                 stdout_w.as_raw_fd(),
                 stderr_w.as_raw_fd(),
+                proto_pipe.as_ref().map(|(_, w)| w.as_raw_fd()),
                 &bpf,
                 diag_fd,
+                tag,
             );
             if let Err(e) = run {
                 // Raw errno print — no allocation in the child.
@@ -288,6 +334,9 @@ impl SandboxLauncher {
                     buf[n] = b;
                     n += 1;
                 }
+                buf[n] = b' ';
+                n += 1;
+                n += write_u32(&mut buf[n..], tag);
                 buf[n] = b'\n';
                 n += 1;
                 // SAFETY: raw write to diag_fd, statically-sized buffer.
@@ -303,6 +352,10 @@ impl SandboxLauncher {
         // PARENT.
         drop(stdout_w);
         drop(stderr_w);
+        drop(stdin_r);
+        // proto_pipe: keep the read end for the caller (persistent workers);
+        // the write end died with the exec or the child's close-on-exec.
+        let proto_fd = proto_pipe.map(|(r, _w)| r);
 
         // The child is blocked on the sync pipe; write its id maps (the
         // child can't — EPERM inside its new PID ns) and release it.
@@ -338,7 +391,10 @@ impl SandboxLauncher {
             cgroup: cg,
             stdout: stdout_r,
             stderr: stderr_r,
+            stdin_w,
+            proto_fd,
             wall: spec.wall_timeout,
+            tag,
         })
     }
 
@@ -412,7 +468,7 @@ impl SandboxLauncher {
         h: ChildHandle,
         output_cap: u64,
     ) -> SandboxResult<(cgroup::Cgroup, drain::Drainer)> {
-        let drainer = drain::Drainer::new(h.stdout, h.stderr, h.pidfd, h.wall, output_cap)?;
+        let drainer = drain::Drainer::new(h.stdout, h.stderr, h.pidfd, h.wall, output_cap, h.pid, h.tag)?;
         Ok((h.cgroup, drainer))
     }
 }
@@ -427,9 +483,60 @@ fn flags_with_netns(flags: u64, template: bool) -> u64 {
     }
 }
 
+// Raw prctl(PR_SET_NAME) so a fork child is externally identifiable at each
+// progress point (comm survives neither execve nor _exit, which is exactly
+// what we want: the name only shows WHERE a stalled child stopped).
+fn set_child_name(tag: u32, prefix: &[u8]) {
+    let mut name = [0u8; 16];
+    let mut n = 0;
+    for b in prefix.iter() {
+        name[n] = *b;
+        n += 1;
+    }
+    let mut v = tag & 0xFFFF;
+    let mut digits = [0u8; 5];
+    let mut d = 0;
+    if v == 0 {
+        digits[d] = b'0';
+        d += 1;
+    }
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    while d > 0 {
+        d -= 1;
+        name[n] = digits[d];
+        n += 1;
+    }
+    // SAFETY: prctl is a stable syscall; name is NUL-padded fixed buffer.
+    unsafe {
+        libc::prctl(libc::PR_SET_NAME, name.as_ptr() as libc::c_ulong, 0, 0, 0);
+    }
+}
+
 fn build_cstrings<'a>(it: impl Iterator<Item = &'a String>) -> Vec<CString> {
     it.map(|s| CString::new(s.as_bytes()).expect("argv must be UTF-8 sans NUL"))
         .collect()
+}
+
+fn write_u32(buf: &mut [u8], mut v: u32) -> usize {
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    if v == 0 {
+        digits[d] = b'0';
+        d += 1;
+    }
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    for i in 0..d {
+        buf[i] = digits[d - 1 - i];
+    }
+    d
 }
 
 fn ptr_array(v: &[CString]) -> Vec<*const libc::c_char> {
@@ -439,6 +546,7 @@ fn ptr_array(v: &[CString]) -> Vec<*const libc::c_char> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_child(
     spec: &ChildSpec,
     argv_ptrs: &[*const libc::c_char],
@@ -446,46 +554,55 @@ fn run_child(
     mount_plan: &mounts::MountPlan,
     apparmor_cmd: Option<&CString>,
     fd_path: Option<&CString>,
+    stdin_r: RawFd,
     stdout_w: RawFd,
     stderr_w: RawFd,
+    proto_w: Option<RawFd>,
     bpf: &seccomp::BpfProfile,
     diag_fd: RawFd,
+    tag: u32,
 ) -> SandboxResult<()> {
-    // 1. Redirect stdout/stderr to pipes. The write-ends are O_CLOEXEC, so
-    // they vanish at exec; the child never returns to close them.
+    // 1. Redirect stdio. The write-ends are O_CLOEXEC, so they vanish at
+    // exec; the child never returns to close them. fd 0 comes from the
+    // launcher's private pipe (never the engine's control-channel stdin);
+    // dup2 clears O_CLOEXEC on the new fd so it survives execve.
+    redirect_to_pipe(stdin_r, libc::STDIN_FILENO)?;
     redirect_to_pipe(stdout_w, libc::STDOUT_FILENO)?;
     redirect_to_pipe(stderr_w, libc::STDERR_FILENO)?;
+    if let Some(pw) = proto_w {
+        redirect_to_pipe(pw, crate::spec::PROTOCOL_FD)?;
+    }
     // Everything after this point writes diagnostics to the ENGINE's stderr
     // (diag_fd) — fd 2 is now the user's stderr and must stay pristine.
-    child_diag(diag_fd, "C3 redirect done");
+    child_diag(diag_fd, tag, "C3 redirect done");
 
     // 2. Mount namespace setup (Layer 3) — prebuilt plan, raw syscalls.
     mount_plan.apply()?;
-    child_diag(diag_fd, "C4 mounts done");
+    child_diag(diag_fd, tag, "C4 mounts done");
 
     // 3. AppArmor (Layer 0/8) — staged for next exec.
     if let Some(cmd) = apparmor_cmd {
         apparmor::write_attr_exec(cmd)?;
     }
-    child_diag(diag_fd, "C5 apparmor done");
+    child_diag(diag_fd, tag, "C5 apparmor done");
 
     // 4. NO_NEW_PRIVS (Layer 7) BEFORE seccomp (FIX SEC-14).
     caps::set_no_new_privs()?;
     if spec.layers.enforce_w_xor_x {
         let _ = caps::enable_mdwe();
     }
-    child_diag(diag_fd, "C6 nnp done");
+    child_diag(diag_fd, tag, "C6 nnp done");
 
     // 5. Seccomp (Layer 3 in §6). Stateless apply — the BPF blob was compiled
     // once at engine boot and is now just being reloaded into this task.
     seccomp::SeccompResolver::apply(bpf)?;
-    child_diag(diag_fd, "C7 seccomp done");
+    child_diag(diag_fd, tag, "C7 seccomp done");
 
     // 6. Drop caps + rlimits (Layers 5 & 6).
     caps::drop_all_capabilities()?;
-    child_diag(diag_fd, "C8 caps done");
+    child_diag(diag_fd, tag, "C8 caps done");
     caps::apply_rlimits(&spec.limits)?;
-    child_diag(diag_fd, "C9 rlimits done");
+    child_diag(diag_fd, tag, "C9 rlimits done");
 
     // 7. execve via fexecve (verified fd) or pinned interpreter path.
     let exe = if let Some(p) = fd_path {
@@ -496,6 +613,8 @@ fn run_child(
     } else {
         return Err(SandboxError::Internal("empty argv".into()));
     };
+    child_diag(diag_fd, tag, "C10 pre-exec");
+    set_child_name(tag, b"rbe");
     // SAFETY: execve is a stable syscall; pointers above are NUL-terminated.
     unsafe {
         libc::execve(exe.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
@@ -512,14 +631,26 @@ fn run_child(
 /// held by a thread that doesn't exist in the child (permanent deadlock).
 /// After the stdout/stderr redirect, `fd` must be the engine's saved stderr
 /// (the user's stderr is fd 2 by then and must not be touched).
-fn child_diag(fd: RawFd, msg: &str) {
+/// The launch tag is appended so interleaved lines stay attributable.
+fn child_diag(fd: RawFd, tag: u32, msg: &str) {
     if !CHILD_DIAG.load(Ordering::Relaxed) {
         return;
     }
-    // SAFETY: write is stable; msg is a valid byte slice.
+    let mut tail = *b" t=0000000000\n";
+    let mut v = tag;
+    let mut i = tail.len() - 2; // last digit slot (before the newline)
+    loop {
+        tail[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 || i == 3 {
+            break;
+        }
+        i -= 1;
+    }
+    // SAFETY: writes are stable; buffers are valid for their lengths.
     unsafe {
         libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
-        libc::write(fd, b"\n".as_ptr() as *const libc::c_void, 1);
+        libc::write(fd, tail.as_ptr() as *const libc::c_void, tail.len());
     }
 }
 

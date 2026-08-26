@@ -36,6 +36,11 @@ pub struct Drainer {
     pub pidfd: OwnedFd,
     pub timer: OwnedFd,
     pub output_cap: u64,
+    /// Child pid, captured for timeout diagnostics (read /proc state before
+    /// the cgroup kill destroys the evidence).
+    pub pid: i32,
+    /// Launch tag for correlating the timeout with the child's C-stage lines.
+    pub tag: u32,
 }
 
 impl Drainer {
@@ -45,6 +50,8 @@ impl Drainer {
         pidfd: OwnedFd,
         wall: Duration,
         output_cap: u64,
+        pid: i32,
+        tag: u32,
     ) -> SandboxResult<Self> {
         let timer = make_timerfd(wall)?;
         Ok(Self {
@@ -53,6 +60,8 @@ impl Drainer {
             pidfd,
             timer,
             output_cap,
+            pid,
+            tag,
         })
     }
 
@@ -147,6 +156,27 @@ impl Drainer {
                         });
                     }
                     4 => {
+                        // Was the child actually long dead and we missed the
+                        // pidfd/pipe wakeup? WNOHANG reap tells us instantly.
+                        let mut probe: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                        let rc = unsafe {
+                            libc::waitid(
+                                libc::P_PIDFD,
+                                self.pidfd.as_raw_fd() as u32,
+                                &mut probe,
+                                libc::WEXITED | libc::WNOHANG,
+                            )
+                        };
+                        // WNOHANG quirk: rc==0 with si_signo==0 means "no
+                        // state change"; si_signo!=0 means reaped.
+                        let early = if rc == 0 && probe.si_signo != 0 {
+                            format!("already-exited si_code={} si_status={}", probe.si_code, unsafe { probe.si_status() })
+                        } else if rc == 0 {
+                            "still-alive(no-state-change)".to_string()
+                        } else {
+                            format!("still-alive rc={rc} errno={}", std::io::Error::last_os_error())
+                        };
+                        log_timeout_state(self.pid, self.tag, &early);
                         cg.kill_all()?;
                         return Ok(ChildExit::Timeout);
                     }
@@ -155,6 +185,97 @@ impl Drainer {
             }
         }
     }
+}
+
+// On a wall-clock timeout, snapshot the child's kernel state before the
+// cgroup kill removes it. This is the only chance to see WHY it never exited.
+fn log_timeout_state(pid: i32, tag: u32, early_exit: &str) {
+    let read = |suffix: &str| std::fs::read_to_string(format!("/proc/{pid}/{suffix}")).unwrap_or_default();
+    let comm = read("comm").trim().to_string();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "?".into());
+    let stat = read("stat");
+    let state = stat
+        .rsplit(')')
+        .next()
+        .and_then(|r| r.split_whitespace().next())
+        .unwrap_or("?")
+        .to_string();
+    let wchan = read("wchan").trim().to_string();
+    let maps = read("maps");
+    let threads = read("status")
+        .lines()
+        .find(|l| l.starts_with("Threads:"))
+        .unwrap_or("Threads: ?")
+        .trim()
+        .to_string();
+    let syscall_raw = read("syscall");
+    let (futex_word, futex_map) = peek_futex(pid, &syscall_raw, &maps);
+    // Resolve the blocked instruction pointer against the child's maps.
+    // /proc/pid/syscall layout: nr arg0..arg5 sp pc - pc is field index 8.
+    let pc_map = syscall_raw
+        .split_whitespace()
+        .nth(8)
+        .and_then(|pc| usize::from_str_radix(pc.trim_start_matches("0x"), 16).ok())
+        .map(|pc| locate_addr(pc, &maps))
+        .unwrap_or_else(|| "-".into());
+    let parent_maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let (parent_word, parent_map) = peek_futex(std::process::id() as i32, &syscall_raw, &parent_maps);
+    tracing::warn!(pid, tag, %comm, %exe, %state, %wchan, %threads, futex_word, futex_map, parent_word, parent_map, pc_map, early_exit, "child_timeout_state");
+}
+
+// Map line (with pathname) containing `addr`, from /proc-style maps content.
+fn locate_addr(addr: usize, maps: &str) -> String {
+    for line in maps.lines() {
+        let mut parts = line.splitn(2, ' ');
+        let range = parts.next().unwrap_or("");
+        let rest = parts.next().unwrap_or("");
+        if let Some((lo, hi)) = range.split_once('-') {
+            if let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) {
+                if addr >= lo && addr < hi {
+                    return format!("{line} (offset={:#x})", addr - lo);
+                }
+            }
+        }
+        let _ = rest;
+    }
+    "mapping-not-found".into()
+}
+
+// Returns (futex word value, maps line containing its address) for the
+// futex(2) the task is blocked on; "-" when not applicable or unreadable.
+fn peek_futex(pid: i32, syscall_raw: &str, maps: &str) -> (String, String) {
+    let fields: Vec<&str> = syscall_raw.split_whitespace().collect();
+    if fields.len() < 2 || fields[0] != "98" {
+        return ("-".into(), "-".into());
+    }
+    let addr = match usize::from_str_radix(fields[1].trim_start_matches("0x"), 16) {
+        Ok(a) => a,
+        Err(_) => return ("-".into(), "-".into()),
+    };
+    let word = std::fs::File::open(format!("/proc/{pid}/mem"))
+        .ok()
+        .and_then(|mut f| {
+            use std::io::{Read, Seek, SeekFrom};
+            f.seek(SeekFrom::Start(addr as u64)).ok()?;
+            let mut b = [0u8; 4];
+            f.read_exact(&mut b).ok()?;
+            Some(i32::from_le_bytes(b).to_string())
+        })
+        .unwrap_or_else(|| "unreadable".into());
+    let map_line = maps
+        .lines()
+        .find(|l| match l.split_whitespace().next().and_then(|r| r.split_once('-')) {
+            Some((lo, hi)) => match (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) {
+                (Ok(lo), Ok(hi)) => addr >= lo && addr < hi,
+                _ => false,
+            },
+            None => false,
+        })
+        .unwrap_or("mapping-not-found")
+        .to_string();
+    (word, map_line)
 }
 
 fn make_timerfd(wall: Duration) -> SandboxResult<OwnedFd> {
