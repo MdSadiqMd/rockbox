@@ -1,0 +1,8 @@
+# Fork children must never run the dynamic loader after clone3: a lazy PLT
+# resolution in the child can take an ld.so/pthread lock that another engine
+# thread held at fork time, deadlocking the child before execve (observed as
+# rare wall-timeout stalls under load). BIND_NOW resolves every PLT entry at
+# engine startup on the main thread, so forked children only issue raw
+# syscalls between C0 and execve.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-args=-Wl,-z,now"]
