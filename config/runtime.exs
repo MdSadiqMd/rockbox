@@ -38,3 +38,31 @@ if config_env() == :prod do
     binary: System.get_env("ROCKBOX_ENGINE_BIN") || "/opt/rockbox/bin/engine",
     data_socket_dir: System.get_env("ROCKBOX_DATA_SOCK_DIR") || "/run/rockbox/data"
 end
+
+config :rockbox,
+       :workspace_concurrency_default,
+       String.to_integer(System.get_env("WORKSPACE_CONCURRENCY", "50"))
+
+config :rockbox,
+  rate_burst: String.to_integer(System.get_env("RATE_BURST", "100")),
+  rate_per_s: String.to_integer(System.get_env("RATE_PER_S", "50"))
+
+# API keys + admin surface. Dev tokens are a dev/test/bench convenience; in
+# prod they are off unless explicitly re-enabled. The admin token gates
+# /api/admin/* (workspace + key provisioning) — unset means disabled.
+parse_flag = fn
+  "" -> nil
+  v -> String.equivalent?(v, "true")
+end
+
+config :rockbox,
+  allow_dev_tokens: parse_flag.(System.get_env("ROCKBOX_ALLOW_DEV_TOKENS", "")),
+  admin_token: System.get_env("ROCKBOX_ADMIN_TOKEN", "")
+
+# User-defined environments: where generated flakes live and where engine
+# descriptors are dropped (must match the engine's ROCKBOX_CUSTOM_RUNTIMES_DIR).
+config :rockbox,
+  environments_root:
+    System.get_env("ROCKBOX_ENVIRONMENTS_ROOT", "/var/lib/rockbox/envs"),
+  custom_runtimes_dir:
+    System.get_env("ROCKBOX_CUSTOM_RUNTIMES_DIR", "/etc/sandbox/custom-runtimes")

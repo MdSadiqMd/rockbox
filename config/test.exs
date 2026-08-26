@@ -19,3 +19,7 @@ config :rockbox, RockboxWeb.Endpoint,
 
 config :logger, level: :warning
 config :phoenix, :plug_init_mode, :runtime
+
+# Rate limiting is exercised by dedicated plug tests only; keep the bucket
+# effectively unlimited elsewhere so suite-wide request volume never 429s.
+config :rockbox, rate_burst: 1_000_000, rate_per_s: 1_000_000

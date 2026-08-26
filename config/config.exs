@@ -13,6 +13,11 @@ config :rockbox, :engine,
   binary: System.get_env("ROCKBOX_ENGINE_BIN") || "core/target/release/engine",
   data_socket_dir: System.get_env("ROCKBOX_DATA_SOCK_DIR") || "/tmp/rockbox-data"
 
+config :rockbox,
+  episodes_root: System.get_env("ROCKBOX_EPISODES_ROOT") || "/var/lib/sandbox/episodes",
+  episode_routes_path:
+    System.get_env("ROCKBOX_EPISODE_ROUTES_PATH") || "/var/lib/rockbox/episode-routes.dets"
+
 # Defaults for the Settings pipeline. Workspaces + tiers override these
 config :rockbox, :settings_defaults, %{
   limits: %{
