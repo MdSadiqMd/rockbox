@@ -54,11 +54,23 @@ impl Cgroup {
 #[derive(Debug)]
 pub struct MountPlan;
 
+/// Shape-mirror of the Linux `ChildHandle` so dependent crates compile on
+/// non-Linux dev hosts. Never constructed: `SandboxLauncher::launch`
+/// always returns `Err(Unsupported)` here.
 #[derive(Debug)]
-pub struct ChildHandle;
+pub struct ChildHandle {
+    pub pid: i32,
+    pub pidfd: std::os::fd::OwnedFd,
+    pub cgroup: Cgroup,
+    pub stdout: std::os::fd::OwnedFd,
+    pub stderr: std::os::fd::OwnedFd,
+    pub stdin_w: std::os::fd::OwnedFd,
+    pub proto_fd: Option<std::os::fd::OwnedFd>,
+    pub wall: Duration,
+}
 impl ChildHandle {
     pub fn pid(&self) -> i32 {
-        -1
+        self.pid
     }
 }
 

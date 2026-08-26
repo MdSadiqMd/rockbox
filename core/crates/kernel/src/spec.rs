@@ -8,6 +8,11 @@ use protocol::Language;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// fd number the child's protocol pipe is dup2'd to when the spec requests
+/// one ([`ChildSpec::protocol_fd`]). Persistent RL workers exchange framed
+/// request/response messages over it, leaving stdout for user output.
+pub const PROTOCOL_FD: i32 = 3;
+
 /// Everything the launcher needs to spawn one sandboxed child.
 #[derive(Debug, Clone)]
 pub struct ChildSpec {
@@ -31,6 +36,12 @@ pub struct ChildSpec {
     pub binary_fd_path: Option<String>,
     /// Wall-clock cap.
     pub wall_timeout: Duration,
+    /// When true, the launcher additionally wires a private request/response
+    /// pipe as fd 3 in the child (survives execve). Used by persistent RL
+    /// workers: protocol frames flow over fd 3 while user stdout/stderr stay
+    /// on their regular pipes. The parent keeps the read end on
+    /// [`crate::ChildHandle::proto_fd`].
+    pub protocol_fd: bool,
 }
 
 #[derive(Debug, Clone)]
