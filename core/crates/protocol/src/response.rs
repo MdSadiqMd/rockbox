@@ -45,6 +45,10 @@ pub enum Response {
     },
 
     /// RL step observation.
+    ///
+    /// Gymnasium-compatible: `terminated` (true env end) and `truncated`
+    /// (time limit / step budget) are reported separately; `done` is kept
+    /// for back-compat and equals `terminated || truncated`.
     RlStep {
         request_id: String,
         episode_id: String,
@@ -53,7 +57,30 @@ pub enum Response {
         reward: f64,
         done: bool,
         #[serde(default)]
+        terminated: bool,
+        #[serde(default)]
+        truncated: bool,
+        #[serde(default)]
         info: BTreeMap<String, String>,
+        /// Optional observation decoding metadata (dtype/shape/encoding),
+        /// emitted by the worker when the env declares it via the `_obs_meta`
+        /// info key. Lets clients decode raw obs bytes without out-of-band
+        /// knowledge.
+        #[serde(default)]
+        obs_meta: Option<BTreeMap<String, String>>,
+    },
+
+    /// RL batched steps — one frame per `Command::RlSteps`, carrying every
+    /// tick plus per-episode cumulative metrics. Order matches the request's
+    /// action list; a failed step ends the batch (its error lands in that
+    /// tick's `info["error"]`).
+    RlSteps {
+        request_id: String,
+        episode_id: String,
+        ticks: Vec<RlTick>,
+        /// Cumulative episode metrics as of this batch: total steps taken,
+        /// sum of rewards, wall time since reset.
+        metrics: EpisodeMetrics,
     },
 
     /// Session-cell completion (state preserved in worker).
@@ -88,6 +115,48 @@ pub enum Response {
 
     /// Engine is about to die (graceful or forced). Always the last frame.
     EngineDied(EngineDeath),
+}
+
+/// One tick inside a [`Response::RlSteps`] batch. Same semantics as
+/// [`Response::RlStep`] minus the repeated `episode_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RlTick {
+    pub request_id: String,
+    #[serde(with = "serde_bytes")]
+    pub observation: Vec<u8>,
+    pub reward: f64,
+    pub done: bool,
+    #[serde(default)]
+    pub terminated: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub info: BTreeMap<String, String>,
+    #[serde(default)]
+    pub obs_meta: Option<BTreeMap<String, String>>,
+}
+
+impl RlTick {
+    pub const fn empty(request_id: String) -> Self {
+        Self {
+            request_id,
+            observation: Vec::new(),
+            reward: 0.0,
+            done: true,
+            terminated: false,
+            truncated: false,
+            info: BTreeMap::new(),
+            obs_meta: None,
+        }
+    }
+}
+
+/// Cumulative per-episode counters, updated engine-side on every exchange.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EpisodeMetrics {
+    pub steps: u64,
+    pub reward_sum: f64,
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

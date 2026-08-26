@@ -17,7 +17,7 @@ pub mod settings;
 
 pub use command::{Command, FileEntry, LspParams};
 pub use error::{ProtocolError, Result};
-pub use response::{EngineDeath, Response, ResultStatus};
+pub use response::{EngineDeath, EpisodeMetrics, Response, ResultStatus, RlTick};
 pub use settings::{
     Capability, CostSettings, Determinism, FilesystemSettings, GpuSettings, Language,
     LifecyclePolicy, LifecycleSettings, Limits, Mode, NetworkSettings, NetworkTier,
