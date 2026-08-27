@@ -468,7 +468,9 @@ impl SandboxLauncher {
         h: ChildHandle,
         output_cap: u64,
     ) -> SandboxResult<(cgroup::Cgroup, drain::Drainer)> {
-        let drainer = drain::Drainer::new(h.stdout, h.stderr, h.pidfd, h.wall, output_cap, h.pid, h.tag)?;
+        let drainer = drain::Drainer::new(
+            h.stdout, h.stderr, h.pidfd, h.wall, output_cap, h.pid, h.tag,
+        )?;
         Ok((h.cgroup, drainer))
     }
 }

@@ -170,11 +170,18 @@ impl Drainer {
                         // WNOHANG quirk: rc==0 with si_signo==0 means "no
                         // state change"; si_signo!=0 means reaped.
                         let early = if rc == 0 && probe.si_signo != 0 {
-                            format!("already-exited si_code={} si_status={}", probe.si_code, unsafe { probe.si_status() })
+                            format!(
+                                "already-exited si_code={} si_status={}",
+                                probe.si_code,
+                                unsafe { probe.si_status() }
+                            )
                         } else if rc == 0 {
                             "still-alive(no-state-change)".to_string()
                         } else {
-                            format!("still-alive rc={rc} errno={}", std::io::Error::last_os_error())
+                            format!(
+                                "still-alive rc={rc} errno={}",
+                                std::io::Error::last_os_error()
+                            )
                         };
                         log_timeout_state(self.pid, self.tag, &early);
                         cg.kill_all()?;
@@ -190,7 +197,8 @@ impl Drainer {
 // On a wall-clock timeout, snapshot the child's kernel state before the
 // cgroup kill removes it. This is the only chance to see WHY it never exited.
 fn log_timeout_state(pid: i32, tag: u32, early_exit: &str) {
-    let read = |suffix: &str| std::fs::read_to_string(format!("/proc/{pid}/{suffix}")).unwrap_or_default();
+    let read =
+        |suffix: &str| std::fs::read_to_string(format!("/proc/{pid}/{suffix}")).unwrap_or_default();
     let comm = read("comm").trim().to_string();
     let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .map(|p| p.to_string_lossy().into_owned())
@@ -221,7 +229,8 @@ fn log_timeout_state(pid: i32, tag: u32, early_exit: &str) {
         .map(|pc| locate_addr(pc, &maps))
         .unwrap_or_else(|| "-".into());
     let parent_maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
-    let (parent_word, parent_map) = peek_futex(std::process::id() as i32, &syscall_raw, &parent_maps);
+    let (parent_word, parent_map) =
+        peek_futex(std::process::id() as i32, &syscall_raw, &parent_maps);
     tracing::warn!(pid, tag, %comm, %exe, %state, %wchan, %threads, futex_word, futex_map, parent_word, parent_map, pc_map, early_exit, "child_timeout_state");
 }
 
@@ -232,7 +241,8 @@ fn locate_addr(addr: usize, maps: &str) -> String {
         let range = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
         if let Some((lo, hi)) = range.split_once('-') {
-            if let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) {
+            if let (Ok(lo), Ok(hi)) = (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16))
+            {
                 if addr >= lo && addr < hi {
                     return format!("{line} (offset={:#x})", addr - lo);
                 }
@@ -266,13 +276,17 @@ fn peek_futex(pid: i32, syscall_raw: &str, maps: &str) -> (String, String) {
         .unwrap_or_else(|| "unreadable".into());
     let map_line = maps
         .lines()
-        .find(|l| match l.split_whitespace().next().and_then(|r| r.split_once('-')) {
-            Some((lo, hi)) => match (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) {
-                (Ok(lo), Ok(hi)) => addr >= lo && addr < hi,
-                _ => false,
+        .find(
+            |l| match l.split_whitespace().next().and_then(|r| r.split_once('-')) {
+                Some((lo, hi)) => {
+                    match (usize::from_str_radix(lo, 16), usize::from_str_radix(hi, 16)) {
+                        (Ok(lo), Ok(hi)) => addr >= lo && addr < hi,
+                        _ => false,
+                    }
+                }
+                None => false,
             },
-            None => false,
-        })
+        )
         .unwrap_or("mapping-not-found")
         .to_string();
     (word, map_line)
