@@ -33,6 +33,9 @@ defmodule RockboxWeb.SessionController do
       {:error, violations} when is_list(violations) ->
         conn |> put_status(422) |> json(%{error: "settings_invalid", violations: violations})
 
+      {:error, :concurrency_exceeded} ->
+        conn |> put_status(429) |> json(%{error: "concurrency_exceeded"})
+
       {:error, reason} ->
         conn |> put_status(500) |> json(%{error: inspect(reason)})
     end

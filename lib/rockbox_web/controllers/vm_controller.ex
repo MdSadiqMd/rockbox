@@ -54,7 +54,22 @@ defmodule RockboxWeb.VMController do
   end
 
   def delete(conn, %{"id" => vm_id}) do
+    # Capture workspace before stopping so we can release the quota slot.
+    # terminate_child brutal-kills the GenServer without running terminate/2,
+    # so the pool/quota cleanup that normally rides on engine death must be
+    # done explicitly here as well (mirrors RLController.delete).
+    workspace_id =
+      case VM.Server.status(vm_id) do
+        %{workspace_id: wid} when is_binary(wid) -> wid
+        _ -> nil
+      end
+
     VM.Supervisor.stop_vm(vm_id)
+
+    if workspace_id do
+      GenServer.cast(Manager, {:vm_dead, vm_id, workspace_id})
+    end
+
     json(conn, %{ok: true})
   end
 
