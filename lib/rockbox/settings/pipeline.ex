@@ -8,6 +8,7 @@ defmodule Rockbox.Settings.Pipeline do
   `:no_op` to skip in tests
   """
 
+  alias Rockbox.Environments
   alias Rockbox.Settings.{CrossField, Defaults, Effective, Tiers, Validator}
   alias Rockbox.SecretsBroker
 
@@ -28,6 +29,7 @@ defmodule Rockbox.Settings.Pipeline do
       with {:ok, validated} <- Validator.validate(payload),
            {:ok, request_id} <- ensure_request_id(validated, ctx),
            {:ok, with_runtime} <- ensure_runtime(validated),
+           :ok <- Environments.authorize_runtime(ctx.workspace_id, with_runtime[:runtime]),
            merged <-
              Defaults.merge(
                with_runtime,

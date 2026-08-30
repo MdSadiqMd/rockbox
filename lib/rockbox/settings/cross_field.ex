@@ -100,27 +100,36 @@ defmodule Rockbox.Settings.CrossField do
     lang = s[:language]
     runtime = s[:runtime]
 
-    case Rockbox.RuntimeCatalog.lookup(runtime) do
-      nil when is_binary(runtime) ->
-        {s, [violation("runtime", runtime, "unknown runtime in catalog") | errs]}
-
-      %Rockbox.RuntimeCatalog.Entry{language: rl} when not is_nil(lang) ->
-        if Atom.to_string(rl) == to_string(lang) do
-          {s, errs}
-        else
-          {s,
-           [
-             violation(
-               "runtime",
-               runtime,
-               "runtime #{runtime} (#{rl}) does not match language=#{lang}"
-             )
-             | errs
-           ]}
-        end
-
-      _ ->
+    cond do
+      # User-defined environments are workspace-owned artifacts validated
+      # against the caller in the pipeline (Environments.authorize_runtime);
+      # they live outside the static catalog by design.
+      is_binary(runtime) and String.starts_with?(runtime, "custom-") ->
         {s, errs}
+
+      true ->
+        case Rockbox.RuntimeCatalog.lookup(runtime) do
+          nil when is_binary(runtime) ->
+            {s, [violation("runtime", runtime, "unknown runtime in catalog") | errs]}
+
+          %Rockbox.RuntimeCatalog.Entry{language: rl} when not is_nil(lang) ->
+            if Atom.to_string(rl) == to_string(lang) do
+              {s, errs}
+            else
+              {s,
+               [
+                 violation(
+                   "runtime",
+                   runtime,
+                   "runtime #{runtime} (#{rl}) does not match language=#{lang}"
+                 )
+                 | errs
+               ]}
+            end
+
+          _ ->
+            {s, errs}
+        end
     end
   end
 

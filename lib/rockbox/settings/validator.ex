@@ -12,7 +12,7 @@ defmodule Rockbox.Settings.Validator do
     schema request_id labels strict
     language runtime files entrypoint
     mode session_id
-    limits lifecycle capabilities network filesystem env secrets stdin
+    limits lifecycle capabilities network filesystem env secrets resolved_secrets stdin
     determinism gpu output observability cost
   )a
 
@@ -42,7 +42,7 @@ defmodule Rockbox.Settings.Validator do
 
   defp maybe_atom(k)
        when k in ~w(schema request_id labels strict language runtime files entrypoint mode session_id
-                                  limits lifecycle capabilities network filesystem env secrets stdin
+                                  limits lifecycle capabilities network filesystem env secrets resolved_secrets stdin
                                   determinism gpu output observability cost) do
     String.to_atom(k)
   end
@@ -64,8 +64,13 @@ defmodule Rockbox.Settings.Validator do
 
   defp normalise_value(_, v), do: v
 
-  defp atomize_keys(map) when is_map(map),
-    do: Map.new(map, fn {k, v} -> {maybe_atom_key(k), v} end)
+  defp atomize_keys(map) when is_map(map) do
+    Map.new(map, fn {k, v} ->
+      key = maybe_atom_key(k)
+      val = if is_map(v), do: atomize_keys(v), else: v
+      {key, val}
+    end)
+  end
 
   defp maybe_atom_key(k) when is_binary(k), do: String.to_atom(k)
   defp maybe_atom_key(k), do: k

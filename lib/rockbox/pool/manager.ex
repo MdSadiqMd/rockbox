@@ -45,10 +45,11 @@ defmodule Rockbox.Pool.Manager do
             {:ok, vm_id}
 
           :empty ->
-            # No idle VM: fall back to the serialised cold-spawn path,
-            # which reserves its own quota slot.
-            QuotaTracker.release(s.workspace_id)
-            GenServer.call(__MODULE__, {:acquire, s}, 10_000)
+            # No idle VM: fall back to the serialised cold-spawn path. The
+            # caller's reservation is kept — {:acquire_cold, ...} never
+            # reserves again, so usage metering counts one request per
+            # acquire and the quota slot can't double-reserve.
+            GenServer.call(__MODULE__, {:acquire_cold, s}, 10_000)
         end
 
       err ->
@@ -96,39 +97,26 @@ defmodule Rockbox.Pool.Manager do
   end
 
   @impl true
-  def handle_call({:acquire, %Effective{} = s}, _from, state) do
+  # Cold-spawn path entered from acquire/1 with the reservation already held.
+  # Also reachable directly (VMController) — that path must reserve first.
+  def handle_call({:acquire_cold, %Effective{} = s}, _from, state) do
     key = pool_key(s)
     ttl_ms = idle_ttl_ms(s)
 
     case take_idle(key, ttl_ms) do
-      {:ok, vm_id, ts} ->
-        case QuotaTracker.reserve(s.workspace_id) do
-          :ok ->
+      {:ok, vm_id, _ts} ->
+        mark_busy(vm_id, key)
+        {:reply, {:ok, vm_id}, state}
+
+      :empty ->
+        case spawn_vm(s) do
+          {:ok, vm_id} ->
             mark_busy(vm_id, key)
             {:reply, {:ok, vm_id}, state}
 
-          err ->
-            # Give the VM back (original idle timestamp preserved) so a
-            # later acquire with capacity can still use it.
-            :ets.insert(@table, {vm_id, %{key: key, state: :idle, ts: ts}})
-            {:reply, err, state}
-        end
-
-      :empty ->
-        case QuotaTracker.reserve(s.workspace_id) do
-          :ok ->
-            case spawn_vm(s) do
-              {:ok, vm_id} ->
-                mark_busy(vm_id, key)
-                {:reply, {:ok, vm_id}, state}
-
-              {:error, reason} ->
-                QuotaTracker.release(s.workspace_id)
-                {:reply, {:error, reason}, state}
-            end
-
-          err ->
-            {:reply, err, state}
+          {:error, reason} ->
+            QuotaTracker.release(s.workspace_id)
+            {:reply, {:error, reason}, state}
         end
     end
   end
