@@ -84,7 +84,10 @@ defmodule Rockbox.RuntimeCatalog do
   def lookup(name), do: Map.get(@by_name, name)
 
   def default_for(:python), do: @by_name["python-base"]
-  def default_for(:typescript), do: @by_name["ts-modern"]
+
+  # Bun boots in ~0.6ms vs node's ~13ms and strips TS natively; `ts-modern`
+  # (Node 22) remains available as an explicit opt-in for node semantics.
+  def default_for(:typescript), do: @by_name["ts-bun"]
   def default_for(:go), do: @by_name["go-std"]
   def default_for(:rust), do: @by_name["rust-tokio"]
   def default_for(:cpp), do: @by_name["cpp-modern"]

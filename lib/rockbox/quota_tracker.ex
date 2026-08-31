@@ -40,6 +40,15 @@ defmodule Rockbox.QuotaTracker do
       :ets.update_counter(@table, {:in_flight, workspace_id}, {2, -1})
       {:error, :concurrency_exceeded}
     else
+      # Lifetime request counter for the usage endpoint. update_counter with
+      # default creates the row on first use.
+      :ets.update_counter(
+        @table,
+        {:total_requests, workspace_id},
+        {2, 1},
+        {{:total_requests, workspace_id}, 0}
+      )
+
       :ok
     end
   end
@@ -47,6 +56,40 @@ defmodule Rockbox.QuotaTracker do
   def release(workspace_id) do
     :ets.update_counter(@table, {:in_flight, workspace_id}, {2, -1, 0, 0})
     :ok
+  end
+
+  @doc """
+  Meter N sandbox steps (single or batched) against the owning workspace.
+  Called by the RL controller after a successful tick response.
+  """
+  def bump_steps(workspace_id, n) when is_integer(n) and n > 0 do
+    :ets.update_counter(
+      @table,
+      {:total_steps, workspace_id},
+      {2, n},
+      {{:total_steps, workspace_id}, 0}
+    )
+
+    :ok
+  end
+
+  def bump_steps(_workspace_id, 0), do: :ok
+
+  @doc "Lifetime usage snapshot for a workspace."
+  def usage(workspace_id) do
+    %{
+      workspace_id: workspace_id,
+      requests_total: counter({:total_requests, workspace_id}),
+      rl_steps_total: counter({:total_steps, workspace_id}),
+      in_flight: in_flight(workspace_id)
+    }
+  end
+
+  defp counter(key) do
+    case :ets.lookup(@table, key) do
+      [{_, n}] -> n
+      [] -> 0
+    end
   end
 
   @doc "Returns `:ok` if the bucket has tokens, `{:error, :rate_limited}` otherwise."
