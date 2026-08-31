@@ -27,6 +27,9 @@ defmodule Rockbox.Application do
         Rockbox.AuditLog,
         Rockbox.WebhookDispatcher,
         Rockbox.SessionRouter,
+        Rockbox.EpisodeRegistry,
+        Rockbox.ApiKeys.Cache,
+        Rockbox.Environments.Builder,
 
         # VM lifecycle
         Rockbox.VM.Registry,

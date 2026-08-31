@@ -79,6 +79,41 @@ defmodule Rockbox.VM.Server do
         {:rl_step, Rockbox.Wire.rl_step(new_request_id(), episode_id, action)}
       )
 
+  @doc """
+  Send an `rl_step` command and block until its tick response arrives.
+  Direct GenServer.reply — no PubSub hop on the hot path.
+  """
+  def rl_step_wait(vm_id, episode_id, action, timeout \\ 15_000) when is_binary(action) do
+    call(
+      vm_id,
+      {:rl_step_wait, Rockbox.Wire.rl_step(new_request_id(), episode_id, action)},
+      timeout
+    )
+  end
+
+  @doc """
+  Send a batched `rl_steps` command and block for the full tick list in one
+  round trip (EnvPool-style). Direct reply, no PubSub hop.
+  """
+  def rl_steps_wait(vm_id, episode_id, actions, timeout \\ 30_000) when is_list(actions) do
+    call(
+      vm_id,
+      {:rl_steps_wait, Rockbox.Wire.rl_steps(new_request_id(), episode_id, actions)},
+      timeout
+    )
+  end
+
+  @doc """
+  Send an EnvPool-style batched `rl_steps` command: N actions pipelined
+  through the engine in one round trip, every tick returned in one response.
+  """
+  def rl_steps(vm_id, episode_id, actions) when is_list(actions),
+    do:
+      call(
+        vm_id,
+        {:rl_steps, Rockbox.Wire.rl_steps(new_request_id(), episode_id, actions)}
+      )
+
   defp new_request_id, do: "req_" <> (:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower))
 
   def stdin(vm_id, data), do: cast(vm_id, {:stdin, data})
@@ -180,6 +215,24 @@ defmodule Rockbox.VM.Server do
   end
 
   def handle_call({:rl_step, %{} = cmd}, _from, state) do
+    Port.command(state.port, Msgpax.pack!(cmd, iodata: true))
+    {:reply, :ok, state}
+  end
+
+  # Direct-reply variants: the caller's from is parked under the request id
+  # and answered the moment the engine's rl frame arrives. Cuts the
+  # PubSub subscribe + broadcast round trip out of the per-step hot path.
+  def handle_call({:rl_step_wait, %{} = cmd}, from, state) do
+    Port.command(state.port, Msgpax.pack!(cmd, iodata: true))
+    {:noreply, %{state | pending: Map.put(state.pending, cmd["id"], {:wait, from})}}
+  end
+
+  def handle_call({:rl_steps_wait, %{} = cmd}, from, state) do
+    Port.command(state.port, Msgpax.pack!(cmd, iodata: true))
+    {:noreply, %{state | pending: Map.put(state.pending, cmd["id"], {:wait, from})}}
+  end
+
+  def handle_call({:rl_steps, %{} = cmd}, _from, state) do
     Port.command(state.port, Msgpax.pack!(cmd, iodata: true))
     {:reply, :ok, state}
   end
@@ -304,7 +357,12 @@ defmodule Rockbox.VM.Server do
 
   defp handle_response(%{"type" => "rl_step"} = msg, state) do
     Phoenix.PubSub.broadcast(Rockbox.PubSub, "vm:#{state.vm_id}", {:rl_step, msg})
-    state
+    settle_pending(msg, state)
+  end
+
+  defp handle_response(%{"type" => "rl_steps"} = msg, state) do
+    Phoenix.PubSub.broadcast(Rockbox.PubSub, "vm:#{state.vm_id}", {:rl_steps, msg})
+    settle_pending(msg, state)
   end
 
   defp handle_response(%{"type" => "engine_died"} = msg, state) do
@@ -321,6 +379,19 @@ defmodule Rockbox.VM.Server do
   defp handle_response(other, state) do
     Phoenix.PubSub.broadcast(Rockbox.PubSub, "vm:#{state.vm_id}", {:other, other})
     state
+  end
+
+  # Answer a parked direct-reply waiter (if any) and return state with the
+  # entry popped. Callers that still ride PubSub are unaffected.
+  defp settle_pending(msg, state) do
+    case Map.pop(state.pending, msg["request_id"]) do
+      {{:wait, from}, rest} ->
+        GenServer.reply(from, {:ok, msg})
+        %{state | status: :idle, pending: rest}
+
+      {_other, rest} ->
+        %{state | pending: rest}
+    end
   end
 
   defp engine_binary, do: Application.get_env(:rockbox, :engine)[:binary]

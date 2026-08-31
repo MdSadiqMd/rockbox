@@ -43,8 +43,29 @@ defmodule Rockbox.Wire do
     }
   end
 
+  # Action bytes travel as msgpack *bin*, not *str* — raw frames are not
+  # necessarily valid UTF-8 and the engine's serde_bytes decoder expects a
+  # byte sequence.
   def rl_step(id, episode_id, action) when is_binary(action) do
-    %{"cmd" => "rl_step", "id" => id, "episode_id" => episode_id, "action" => action}
+    %{
+      "cmd" => "rl_step",
+      "id" => id,
+      "episode_id" => episode_id,
+      "action" => Msgpax.Bin.new(action)
+    }
+  end
+
+  @doc """
+  Encode an EnvPool-style batched RL step command. `actions` is a list of
+  binary action frames; every tick comes back in one `rl_steps` response.
+  """
+  def rl_steps(id, episode_id, actions) when is_list(actions) do
+    %{
+      "cmd" => "rl_steps",
+      "id" => id,
+      "episode_id" => episode_id,
+      "actions" => Enum.map(actions, &Msgpax.Bin.new/1)
+    }
   end
 
   def stdin(data) when is_binary(data), do: %{"cmd" => "stdin", "data" => data}
