@@ -261,7 +261,12 @@ impl App {
                     id,
                     episode_id,
                     action,
-                } => modes::rl::step(&state, id, episode_id, action, &writer, data.as_ref()).await,
+                } => modes::rl::step(&state, id, episode_id, action, &writer).await,
+                Command::RlSteps {
+                    id,
+                    episode_id,
+                    actions,
+                } => modes::rl::steps_batch(&state, id, episode_id, actions, &writer).await,
                 Command::Stdin { data: bytes } => state.send_stdin(&bytes).await,
                 Command::Interrupt { id } => state.interrupt(&id).await,
                 Command::Lsp(p) => modes::lsp::relay(&state, p, &writer).await,
