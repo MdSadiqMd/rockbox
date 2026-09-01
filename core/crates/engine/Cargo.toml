@@ -19,6 +19,7 @@ protocol = { workspace = true }
 msgpack  = { workspace = true }
 cache    = { workspace = true }
 kernel   = { workspace = true }
+libc     = { workspace = true }
 
 tokio              = { workspace = true }
 serde              = { workspace = true }

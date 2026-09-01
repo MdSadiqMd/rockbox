@@ -12,7 +12,7 @@ use anyhow::Result;
 use cache::{BinaryCache, EnvCache};
 use kernel::SandboxLauncher;
 use parking_lot::Mutex;
-use protocol::Language;
+use protocol::{EpisodeMetrics, Language};
 use std::sync::Arc;
 
 pub struct EngineState {
@@ -31,10 +31,11 @@ pub struct EngineState {
     /// `/var/lib/sandbox/sessions/<uuid>/` (bind-mounted RW into the sandbox
     /// as `/session`) so state survives across per-cell sandbox spawns.
     pub sessions: Mutex<std::collections::HashMap<String, protocol::Settings>>,
-    /// RL episode state, keyed by episode id. Same pattern as `sessions`
-    /// but the persistent bind is `/episode` and the shim implements
-    /// reset+step semantics against a user env module.
-    pub episodes: Mutex<std::collections::HashMap<String, protocol::Settings>>,
+    /// RL episode state, keyed by episode id. Each entry holds the frozen
+    /// settings plus the LIVE sandboxed worker process (persistent across
+    /// steps; SEED-RL-style streaming over its fd-3 protocol pipe). Dropping
+    /// the entry kills the worker's cgroup.
+    pub episodes: Mutex<std::collections::HashMap<String, EpisodeEntry>>,
     /// LSP language-server child pool, keyed by language. Servers are
     /// long-lived and reused across relay() calls; killed on engine shutdown.
     pub lsp_servers: Mutex<std::collections::HashMap<Language, Arc<crate::modes::lsp::LspServer>>>,
@@ -55,6 +56,24 @@ pub struct RequestState {
     pub request_id: String,
     pub stdin_writer: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     pub interrupt: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+#[derive(Debug)]
+pub struct EpisodeEntry {
+    pub settings: protocol::Settings,
+    /// Live sandboxed worker. `None` once the worker died or timed out; the
+    /// episode then answers every further step with done=true + error.
+    pub worker: Option<crate::modes::rl::Worker>,
+    /// Cumulative counters since reset, updated after every exchange and
+    /// reported back on each tick/batch so training loops can track return
+    /// and env FPS without extra round trips.
+    pub metrics: EpisodeMetrics,
+    /// Monotonic timestamp of episode creation (metrics elapsed_ms base).
+    pub created_at_ms: u64,
+    /// Worker was spawned from a checkpoint (resume mode) instead of a
+    /// fresh reset. The first successful tick announces this in info.
+    pub resumed: bool,
+    pub resumed_notified: bool,
 }
 
 impl EngineState {
