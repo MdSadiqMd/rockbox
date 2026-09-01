@@ -127,10 +127,7 @@ defmodule RockboxWeb.FileController do
   defp store_op(conn, {:error, {:is_not_regular, type}}),
     do: conn |> put_status(409) |> json(%{error: "not_a_regular_file", type: type})
 
-  defp store_op(conn, {:error, reason}) when is_atom(reason), do: file_error(conn, reason)
-
-  defp store_op(conn, {:error, reason}),
-    do: conn |> put_status(400) |> json(%{error: "file_error", reason: inspect(reason)})
+  defp store_op(conn, {:error, reason}), do: file_error(conn, reason)
 
   defp file_error(conn, :enoent),
     do: conn |> put_status(404) |> json(%{error: "not_found", reason: :enoent})
