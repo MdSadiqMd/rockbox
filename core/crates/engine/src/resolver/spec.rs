@@ -29,7 +29,7 @@ use crate::runtime_catalog::{self, RuntimeEntry};
 use anyhow::{Result, anyhow, bail};
 use cache::{BinaryCache, BinaryKey};
 use kernel::spec::{ChildSpec, SandboxLayers};
-use protocol::{Capability, Language, Settings};
+use protocol::{Capability, Language, Mode, Settings};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -47,16 +47,11 @@ pub fn resolve(
 ) -> Result<Resolved> {
     settings.validate().map_err(|e| anyhow!(e))?;
 
-    let runtime_name = settings
-        .runtime
-        .as_deref()
-        .unwrap_or(match settings.language {
-            Language::Python => "python-base",
-            Language::Typescript => "ts-modern",
-            Language::Go => "go-std",
-            Language::Rust => "rust-tokio",
-            Language::Cpp => "cpp-modern",
-        });
+    let runtime_name = settings.runtime.as_deref().unwrap_or_else(|| {
+        runtime_catalog::default_for(settings.language)
+            .name
+            .as_str()
+    });
     let runtime = runtime_catalog::lookup(runtime_name)
         .ok_or_else(|| anyhow!("unknown runtime {runtime_name}"))?;
 
@@ -82,7 +77,12 @@ pub fn resolve(
     let mat_ms = t_mat.elapsed().as_micros() as u64;
 
     let t_env = std::time::Instant::now();
-    let env_pairs = env::resolve(settings, runtime.baseline_env);
+    let baseline_env: Vec<(&str, &str)> = runtime
+        .baseline_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let env_pairs = env::resolve(settings, &baseline_env);
     let limits = limits::resolve(settings);
     let seccomp_id = seccomp::resolve(settings);
     let apparmor_profile = apparmor::resolve(settings);
@@ -111,7 +111,7 @@ pub fn resolve(
     // skip the compiler entirely and execve the verified cached fd.
     let t_bin = std::time::Instant::now();
     let mut binary_fd_path = None;
-    let mut compile_ms = 0u64;
+    let mut compile_ms: Option<u64> = None;
     let mut cache_hit = false;
     let argv = match settings.language {
         Language::Go => {
@@ -135,7 +135,7 @@ pub fn resolve(
                     format!("/sandbox/{}", settings.entrypoint),
                 ]
             } else {
-                let key = compile_key(runtime, &input_digest);
+                let key = compile_key(&runtime, &input_digest);
                 let t_lookup = std::time::Instant::now();
                 let lookup = binary_cache.and_then(|c| c.lookup(&key).ok());
                 let lookup_ms = t_lookup.elapsed().as_micros() as u64;
@@ -148,7 +148,7 @@ pub fn resolve(
                     None => {
                         let t_pre = std::time::Instant::now();
                         precompile(settings.language, bin_path, &work_dir, &settings.entrypoint)?;
-                        compile_ms = t_pre.elapsed().as_micros() as u64;
+                        compile_ms = Some(t_pre.elapsed().as_micros() as u64);
                         if let Some(c) = binary_cache {
                             let out = work_dir.join("main");
                             if out.exists() {
@@ -169,7 +169,7 @@ pub fn resolve(
             // Content-addressed BinaryCache: warm hits execve the verified
             // cached fd (the compiler never runs); misses compile once with
             // the toolchain and store the artifact for later requests.
-            let key = compile_key(runtime, &input_digest);
+            let key = compile_key(&runtime, &input_digest);
             let t_lookup = std::time::Instant::now();
             let lookup = binary_cache.and_then(|c| c.lookup(&key).ok());
             let lookup_ms = t_lookup.elapsed().as_micros() as u64;
@@ -182,7 +182,7 @@ pub fn resolve(
                 None => {
                     let t_pre = std::time::Instant::now();
                     precompile(settings.language, bin_path, &work_dir, &settings.entrypoint)?;
-                    compile_ms = t_pre.elapsed().as_micros() as u64;
+                    compile_ms = Some(t_pre.elapsed().as_micros() as u64);
                     if let Some(c) = binary_cache {
                         // Populate the shared cache so the next identical
                         // request skips the compiler (best-effort: the cache
@@ -238,7 +238,13 @@ pub fn resolve(
         "/tmp/resolve_timing.log",
         format!(
             "RESOLVE_TIMING digest_us={} mat_us={} env_us={} compile_us={} mount_us={} total_us={} hit={}\n",
-            digest_ms, mat_ms, env_ms, compile_ms, mount_ms, bin_total_ms, cache_hit
+            digest_ms,
+            mat_ms,
+            env_ms,
+            compile_ms.unwrap_or(0),
+            mount_ms,
+            bin_total_ms,
+            cache_hit
         ),
     );
 
@@ -258,6 +264,8 @@ pub fn resolve(
         apparmor_profile,
         binary_fd_path,
         wall_timeout: Duration::from_millis(settings.limits.wall_ms),
+        // Only RL episodes need the private fd-3 request/response pipe.
+        protocol_fd: matches!(settings.mode, Mode::RlStep | Mode::RlEpisode),
     };
     Ok(Resolved { spec, work_dir })
 }
@@ -314,10 +322,10 @@ fn materialize_work_dir(settings: &Settings, work_dir: &Path, digest: &[u8; 32])
 /// Cache key for a compile. The frozen `flake.lock` pins the toolchain, so
 /// code + lock + arch uniquely identify the artifact. `digest` is the
 /// already-computed `files_digest` of the program.
-fn compile_key(runtime: &'static RuntimeEntry, digest: &[u8; 32]) -> BinaryKey {
+fn compile_key(runtime: &RuntimeEntry, digest: &[u8; 32]) -> BinaryKey {
     BinaryKey::from_parts(
         digest,
-        runtime.executable,
+        &runtime.executable,
         std::env::consts::ARCH,
         runtime.flake_lock_bytes(),
     )
