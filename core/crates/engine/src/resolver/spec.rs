@@ -28,16 +28,238 @@ use crate::resolver::{apparmor, env, limits, mount, seccomp};
 use crate::runtime_catalog::{self, RuntimeEntry};
 use anyhow::{Result, anyhow, bail};
 use cache::{BinaryCache, BinaryKey};
+use dashmap::DashMap;
 use kernel::spec::{ChildSpec, SandboxLayers};
-use protocol::{Capability, Language, Mode, Settings};
-use sha2::{Digest, Sha256};
+use protocol::settings::{DnsMode, MountMode};
+use protocol::{Capability, Language, Mode, NetworkTier, OutputAction, Settings};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Duration;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Resolved {
     pub spec: ChildSpec,
     pub work_dir: PathBuf,
+}
+
+static RESOLVED_CACHE: LazyLock<DashMap<[u8; 32], Resolved>> =
+    LazyLock::new(|| DashMap::with_capacity(256));
+
+fn resolved_cache() -> &'static DashMap<[u8; 32], Resolved> {
+    &RESOLVED_CACHE
+}
+
+/// SOTA Loop20: structured hash, zero `format!("{:?}")` allocs. The old key
+/// built SIX debug strings per resolve (each walks + allocates: language,
+/// mode, limits, capabilities, network, filesystem, env, determinism,
+/// observability) plus a 64-char hex `String` key. The new key feeds
+/// discriminants + LE ints + length-prefixed str bytes straight into blake3
+/// and uses the raw 32B digest as the `DashMap` key — no hex, no `String`.
+/// Same field set as before (no semantic change); `BTreeMap`/vec order is
+/// iteration order in both (pipeline output is deterministic).
+fn resolved_cache_key(
+    settings: &Settings,
+    input_digest: &[u8; 32],
+    runtime_name: &str,
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(input_digest);
+    h.update(&(runtime_name.len() as u64).to_le_bytes());
+    h.update(runtime_name.as_bytes());
+    h.update(&[match settings.language {
+        Language::Python => 0,
+        Language::Typescript => 1,
+        Language::Go => 2,
+        Language::Rust => 3,
+        Language::Cpp => 4,
+    }]);
+    h.update(&[match settings.mode {
+        Mode::Exec => 0,
+        Mode::Session => 1,
+        Mode::RlStep => 2,
+        Mode::RlEpisode => 3,
+    }]);
+    // Limits (all numeric fields LE; Options as tag + payload).
+    let l = &settings.limits;
+    h.update(&l.wall_ms.to_le_bytes());
+    match l.cpu_ms {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    h.update(&l.compile_ms.to_le_bytes());
+    h.update(&l.memory_mb.to_le_bytes());
+    h.update(&l.cpu_cores.to_bits().to_le_bytes());
+    h.update(&l.pids_max.to_le_bytes());
+    h.update(&l.fd_max.to_le_bytes());
+    h.update(&l.fsize_mb.to_le_bytes());
+    h.update(&l.tmpfs_mb.to_le_bytes());
+    h.update(&l.stack_mb.to_le_bytes());
+    h.update(&l.output_bytes.to_le_bytes());
+    h.update(&[match l.output_action {
+        OutputAction::Truncate => 0,
+        OutputAction::KillOnOverflow => 1,
+    }]);
+    match l.step_ms {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    match l.episode_ms {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    // Capabilities in pipeline order.
+    h.update(&(settings.capabilities.len() as u64).to_le_bytes());
+    for c in &settings.capabilities {
+        h.update(&[match c {
+            Capability::Concurrency => 0,
+            Capability::Subprocess => 1,
+            Capability::LargeFs => 2,
+            Capability::PersistentSession => 3,
+            Capability::Gpu => 4,
+            Capability::Install => 5,
+            Capability::RawSockets => 6,
+        }]);
+    }
+    // Network.
+    let n = &settings.network;
+    h.update(&[match n.tier {
+        NetworkTier::None => 0,
+        NetworkTier::Loopback => 1,
+        NetworkTier::EgressAllowlist => 2,
+        NetworkTier::EgressOpen => 3,
+    }]);
+    match &n.allowlist {
+        Some(list) => {
+            h.update(&[1]);
+            h.update(&(list.len() as u64).to_le_bytes());
+            for v in list {
+                h.update(&(v.len() as u64).to_le_bytes());
+                h.update(v.as_bytes());
+            }
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    match n.bandwidth_mbps {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    match n.max_conns {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    h.update(&[u8::from(n.block_metadata)]);
+    h.update(&[match n.dns.mode {
+        DnsMode::Proxied => 0,
+        DnsMode::None => 1,
+    }]);
+    h.update(&n.dns.cache_s.to_le_bytes());
+    // Filesystem.
+    let f = &settings.filesystem;
+    h.update(&(f.writable_paths.len() as u64).to_le_bytes());
+    for v in &f.writable_paths {
+        h.update(&(v.len() as u64).to_le_bytes());
+        h.update(v.as_bytes());
+    }
+    h.update(&(f.mounts.len() as u64).to_le_bytes());
+    for m in &f.mounts {
+        h.update(&(m.source.len() as u64).to_le_bytes());
+        h.update(m.source.as_bytes());
+        h.update(&(m.target.len() as u64).to_le_bytes());
+        h.update(m.target.as_bytes());
+        h.update(&[match m.mode {
+            MountMode::Ro => 0,
+            MountMode::Rw => 1,
+        }]);
+    }
+    h.update(&[u8::from(f.preserve_on_exit)]);
+    // Env (BTreeMap iterates sorted — canonical).
+    h.update(&(settings.env.len() as u64).to_le_bytes());
+    for (k, v) in &settings.env {
+        h.update(&(k.len() as u64).to_le_bytes());
+        h.update(k.as_bytes());
+        h.update(&(v.len() as u64).to_le_bytes());
+        h.update(v.as_bytes());
+    }
+    // Determinism.
+    let d = &settings.determinism;
+    match d.seed {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&v.to_le_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    h.update(&[u8::from(d.deterministic_time)]);
+    h.update(&[u8::from(d.freeze_random)]);
+    match &d.pin_runtime_hash {
+        Some(v) => {
+            h.update(&[1]);
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v.as_bytes());
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    // Observability.
+    let o = &settings.observability;
+    h.update(&[u8::from(o.capture_metrics)]);
+    h.update(&[u8::from(o.trace_syscalls)]);
+    match &o.webhook {
+        Some(w) => {
+            h.update(&[1]);
+            h.update(&(w.url.len() as u64).to_le_bytes());
+            h.update(w.url.as_bytes());
+            h.update(&(w.events.len() as u64).to_le_bytes());
+            for e in &w.events {
+                h.update(&(e.len() as u64).to_le_bytes());
+                h.update(e.as_bytes());
+            }
+            match &w.hmac_key {
+                Some(k) => {
+                    h.update(&[1]);
+                    h.update(&(k.len() as u64).to_le_bytes());
+                    h.update(k.as_bytes());
+                }
+                None => {
+                    h.update(&[0]);
+                }
+            }
+        }
+        None => {
+            h.update(&[0]);
+        }
+    }
+    *h.finalize().as_bytes()
 }
 
 pub fn resolve(
@@ -68,9 +290,24 @@ pub fn resolve(
     // the unique request_id: identical programs (repeated RL steps, retries,
     // deduped CI runs) share one directory, so the per-request file writes
     // and mkdir chains only happen once per distinct program.
+    // Work dirs are keyed by the content digest of the program rather than
+    // the unique request_id: identical programs (repeated RL steps, retries,
+    // deduped CI runs) share one directory, so the per-request file writes
+    // and mkdir chains only happen once per distinct program.
+    // SOTA Loop20: cache lookup BEFORE `work_dir` hex+join — hits (the hot
+    // path for repeated programs) skip the 64-char hex `String` + `PathBuf`
+    // alloc entirely; the cached `Resolved` already carries `work_dir`.
     let t_digest = std::time::Instant::now();
     let input_digest = files_digest(settings);
     let digest_ms = t_digest.elapsed().as_micros() as u64;
+    let cache_key = resolved_cache_key(settings, &input_digest, runtime_name);
+    if let Some(cached) = resolved_cache().get(&cache_key) {
+        let mut hit = cached.clone();
+        hit.spec.request_id = settings.request_id.clone();
+        hit.spec.wall_timeout = Duration::from_millis(settings.limits.wall_ms);
+        tracing::debug!(cache_hit = true, "resolved_cache_hit");
+        return Ok(hit);
+    }
     let work_dir = work_root.join(hex_digest(&input_digest));
     let t_mat = std::time::Instant::now();
     materialize_work_dir(settings, &work_dir, &input_digest)?;
@@ -264,26 +501,27 @@ pub fn resolve(
         apparmor_profile,
         binary_fd_path,
         wall_timeout: Duration::from_millis(settings.limits.wall_ms),
-        // Only RL episodes need the private fd-3 request/response pipe.
         protocol_fd: matches!(settings.mode, Mode::RlStep | Mode::RlEpisode),
     };
-    Ok(Resolved { spec, work_dir })
+    let resolved = Resolved { spec, work_dir };
+    resolved_cache().insert(cache_key, resolved.clone());
+    Ok(resolved)
 }
 
 /// Content digest over entrypoint + every file (path + bytes). Identical
 /// programs — including across users, since user code is untrusted and
 /// content-addressing is purely a caching concern — map to one work dir.
 fn files_digest(settings: &Settings) -> [u8; 32] {
-    let mut h = Sha256::new();
+    let mut h = blake3::Hasher::new();
     h.update(settings.entrypoint.as_bytes());
-    h.update([0]);
+    h.update(&[0]);
     for f in &settings.files {
         h.update(f.path.as_bytes());
-        h.update([0]);
+        h.update(&[0]);
         h.update(&f.content);
-        h.update([0]);
+        h.update(&[0]);
     }
-    h.finalize().into()
+    *h.finalize().as_bytes()
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {
@@ -552,4 +790,223 @@ fn cpp_toolchain_lib_dirs(compiler: &Path) -> &'static [String] {
         }
         dirs
     })
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+    use protocol::settings::{
+        CostSettings, Determinism, DnsSettings, FileEntry, FilesystemSettings, GpuSettings,
+        LifecyclePolicy, LifecycleSettings, Limits, NetworkSettings, ObservabilitySettings,
+        OutputAction, OutputSettings,
+    };
+
+    fn minimal_settings() -> Settings {
+        Settings {
+            schema: "v1".to_string(),
+            request_id: "req_test".to_string(),
+            labels: Default::default(),
+            language: Language::Python,
+            runtime: Some("python3".to_string()),
+            files: vec![],
+            entrypoint: "main.py".to_string(),
+            mode: Mode::Exec,
+            session_id: None,
+            limits: Limits {
+                wall_ms: 5000,
+                cpu_ms: None,
+                compile_ms: 30_000,
+                memory_mb: 512,
+                cpu_cores: 1.0,
+                pids_max: 64,
+                fd_max: 1024,
+                fsize_mb: 100,
+                tmpfs_mb: 100,
+                stack_mb: 8,
+                output_bytes: 1_000_000,
+                output_action: OutputAction::Truncate,
+                step_ms: None,
+                episode_ms: None,
+            },
+            lifecycle: LifecycleSettings {
+                idle_ttl_s: 0,
+                max_lifetime_s: 3600,
+                auto_destroy: true,
+                keep_alive_on_error: false,
+                restart_policy: LifecyclePolicy::None,
+            },
+            capabilities: vec![],
+            network: NetworkSettings {
+                tier: NetworkTier::None,
+                allowlist: None,
+                bandwidth_mbps: None,
+                max_conns: None,
+                block_metadata: true,
+                dns: DnsSettings {
+                    mode: DnsMode::Proxied,
+                    cache_s: 60,
+                },
+            },
+            filesystem: FilesystemSettings {
+                writable_paths: vec![],
+                mounts: vec![],
+                preserve_on_exit: false,
+            },
+            env: Default::default(),
+            resolved_secrets: Default::default(),
+            stdin: None,
+            determinism: Determinism::default(),
+            gpu: GpuSettings::default(),
+            output: OutputSettings {
+                stream: false,
+                binary_safe: true,
+                merge_streams: false,
+                include_metrics: false,
+            },
+            observability: ObservabilitySettings {
+                capture_metrics: false,
+                trace_syscalls: false,
+                webhook: None,
+            },
+            cost: CostSettings::default(),
+        }
+    }
+
+    fn key_of(s: &Settings) -> [u8; 32] {
+        let digest = files_digest(s);
+        resolved_cache_key(s, &digest, "python3")
+    }
+
+    #[test]
+    fn same_settings_same_key() {
+        assert_eq!(key_of(&minimal_settings()), key_of(&minimal_settings()));
+    }
+
+    #[test]
+    fn request_id_does_not_affect_key() {
+        // Per-request patching on cache hit (request_id, wall_timeout) is
+        // only sound because the key ignores per-request fields.
+        let mut a = minimal_settings();
+        let mut b = minimal_settings();
+        a.request_id = "req_aaa".to_string();
+        b.request_id = "req_bbb".to_string();
+        assert_eq!(key_of(&a), key_of(&b));
+    }
+
+    #[test]
+    fn language_mode_env_determinism_affect_key() {
+        let base = key_of(&minimal_settings());
+        let mut s = minimal_settings();
+        s.language = Language::Go;
+        assert_ne!(base, key_of(&s));
+        let mut s = minimal_settings();
+        s.mode = Mode::RlEpisode;
+        assert_ne!(base, key_of(&s));
+        let mut s = minimal_settings();
+        s.env.insert("FOO".to_string(), "bar".to_string());
+        assert_ne!(base, key_of(&s));
+        let mut s = minimal_settings();
+        s.determinism.seed = Some(42);
+        assert_ne!(base, key_of(&s));
+    }
+
+    #[test]
+    fn files_digest_stable_and_content_sensitive() {
+        let a = minimal_settings();
+        assert_eq!(files_digest(&a), files_digest(&minimal_settings()));
+        let mut b = minimal_settings();
+        b.files.push(FileEntry {
+            path: "main.py".to_string(),
+            content: b"print(1)".to_vec(),
+            mode: 0o644,
+        });
+        let mut c = minimal_settings();
+        c.files.push(FileEntry {
+            path: "main.py".to_string(),
+            content: b"print(2)".to_vec(),
+            mode: 0o644,
+        });
+        assert_ne!(files_digest(&b), files_digest(&c));
+        // ... and the content difference propagates into the cache key.
+        assert_ne!(key_of(&b), key_of(&c));
+    }
+
+    #[test]
+    fn resolved_clone_cost_bench() {
+        // Sizes mirror a warm python exec: 6 mounts, 3 argv words, 25 env
+        // pairs, short profile/id strings, interpreted (no binary fd).
+        use kernel::spec::{MountKind, ResourceLimits, SeccompProfileId};
+        let spec = ChildSpec {
+            request_id: "req_bench0123456789".to_string(),
+            language: Language::Python,
+            mounts: vec![
+                MountKind::BindRo {
+                    src: "/nix/store/abc123-python3-minimal".into(),
+                    target: "/nix/store".into(),
+                },
+                MountKind::BindRo {
+                    src: "/nix/store/def456-dev-min".into(),
+                    target: "/dev-min".into(),
+                },
+                MountKind::BindRw {
+                    src: "/tmp/rockbox-work/9f8e7d6c".into(),
+                    target: "/sandbox".into(),
+                },
+                MountKind::Proc {
+                    target: "/proc".into(),
+                },
+                MountKind::Tmpfs {
+                    target: "/tmp".into(),
+                    size_bytes: 512 << 20,
+                    mode: 0o1777,
+                },
+                MountKind::Tmpfs {
+                    target: "/run".into(),
+                    size_bytes: 64 << 20,
+                    mode: 0o755,
+                },
+            ],
+            argv: vec!["python3".into(), "-S".into(), "/sandbox/main.py".into()],
+            env: (0..25)
+                .map(|i| {
+                    (
+                        format!("ROCKBOX_BASE_VAR_{i:02}"),
+                        format!("value-{i}-with-padding"),
+                    )
+                })
+                .collect(),
+            limits: ResourceLimits {
+                memory_bytes: 512 << 20,
+                cpu_quota_us: 100_000,
+                cpu_period_us: 100_000,
+                pids_max: 200,
+                nofile: 256,
+                fsize_bytes: 50 << 20,
+                address_space_bytes: 1 << 32,
+                stack_bytes: 8 << 20,
+            },
+            seccomp_profile: SeccompProfileId::InterpAot,
+            layers: SandboxLayers::default(),
+            apparmor_profile: "rockbox-python-base".to_string(),
+            binary_fd_path: None,
+            wall_timeout: Duration::from_millis(5000),
+            protocol_fd: false,
+        };
+        let resolved = Resolved {
+            spec,
+            work_dir: "/tmp/rockbox-work/9f8e7d6c5b4a".into(),
+        };
+        const N: usize = 50_000;
+        for _ in 0..1_000 {
+            std::hint::black_box(resolved.clone());
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            std::hint::black_box(resolved.clone());
+        }
+        eprintln!(
+            "resolved clone: {:.3}µs/op",
+            t.elapsed().as_micros() as f64 / N as f64
+        );
+    }
 }
