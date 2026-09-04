@@ -58,7 +58,13 @@ pub async fn run<W: AsyncWrite + Unpin>(
     let launcher = match state.launcher.as_ref() {
         Some(l) => l.clone(),
         None => {
-            super::die(writer, "platform_unsupported", Some("Linux-only".into())).await;
+            super::die(
+                writer,
+                "platform_unsupported",
+                Some("Linux-only".into()),
+                Some(request_id.clone()),
+            )
+            .await;
             return Ok(());
         }
     };

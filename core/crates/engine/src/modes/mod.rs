@@ -16,9 +16,9 @@ use tokio::io::AsyncWrite;
 
 pub mod exec;
 pub mod lsp;
+pub mod memfd;
 pub mod rl;
 pub mod session;
-
 /// `/tmp/rockbox-work` is process-global; mkdir it once, not per request.
 /// Every mode joins its request work dirs under this root.
 pub fn work_root() -> &'static PathBuf {
@@ -49,17 +49,21 @@ pub async fn dispatch<W: AsyncWrite + Unpin>(
 
 /// Helper: emit an `EngineDied` response and abort the loop. Used by mode
 /// handlers when something irrecoverable happens (e.g. cgroup setup failed).
+/// `last_request_id` lets the orchestrator answer the parked caller for
+/// THAT request instead of hanging it until controller timeout (the engine
+/// stays alive after `die` — only this request was aborted).
 pub async fn die<W: AsyncWrite + Unpin>(
     writer: &FrameWriter<W>,
     reason: &str,
     detail: impl Into<Option<String>>,
+    last_request_id: Option<String>,
 ) {
     let _ = writer
         .write(&Response::EngineDied(protocol::EngineDeath {
             reason: reason.into(),
             detail: detail.into(),
             exit_status: None,
-            last_request_id: None,
+            last_request_id,
             restart_safe: true,
         }))
         .await;
