@@ -26,8 +26,14 @@ use tracing::debug;
 static CHILD_DIAG: AtomicBool = AtomicBool::new(false);
 
 /// Upper bound on pooled cgroups. Beyond this, released cgroups are removed
-/// from the filesystem instead of being recycled.
-const MAX_POOLED_CGROUPS: usize = 32;
+/// from the filesystem instead of being recycled. SOTA tuning loop2:
+/// 32 → 128 to match 96-concurrent-workers + RL episodes (each holds one
+/// cgroup for its lifetime). At 32, the 33rd concurrent episode paid
+/// cgroup mkdir+mount ( ~30µs) + rmdir on release; at 128 the hot path
+/// stays in pooled bulk for the whole bench. Memory cost ~128 * empty
+/// cgroup dir (few KB). Graceful under load is preserved — quota still caps
+/// concurrent sandboxes near core count.
+const MAX_POOLED_CGROUPS: usize = 128;
 
 #[derive(Debug)]
 pub struct ChildHandle {
