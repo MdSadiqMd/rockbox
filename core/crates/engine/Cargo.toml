@@ -33,11 +33,11 @@ tracing-subscriber = { workspace = true }
 uuid               = { workspace = true }
 sha2               = { workspace = true }
 hex                = { workspace = true }
+blake3             = { workspace = true }
 parking_lot        = { workspace = true }
 once_cell          = { workspace = true }
 bytes              = { workspace = true }
 dashmap            = { workspace = true }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }
 nix  = { workspace = true }
