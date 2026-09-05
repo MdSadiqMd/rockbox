@@ -62,7 +62,6 @@ config :rockbox,
 # User-defined environments: where generated flakes live and where engine
 # descriptors are dropped (must match the engine's ROCKBOX_CUSTOM_RUNTIMES_DIR).
 config :rockbox,
-  environments_root:
-    System.get_env("ROCKBOX_ENVIRONMENTS_ROOT", "/var/lib/rockbox/envs"),
+  environments_root: System.get_env("ROCKBOX_ENVIRONMENTS_ROOT", "/var/lib/rockbox/envs"),
   custom_runtimes_dir:
     System.get_env("ROCKBOX_CUSTOM_RUNTIMES_DIR", "/etc/sandbox/custom-runtimes")

@@ -23,3 +23,9 @@ config :phoenix, :plug_init_mode, :runtime
 # Rate limiting is exercised by dedicated plug tests only; keep the bucket
 # effectively unlimited elsewhere so suite-wide request volume never 429s.
 config :rockbox, rate_burst: 1_000_000, rate_per_s: 1_000_000
+
+# Exec cache is a warm-path optimization for repeated programs. In test each
+# `POST /api/execute` is expected to hit the engine exactly once so
+# determinism and quota tests don't see cross-test hits. Disabled here;
+# bench/prod keep it enabled (SOTA loop 2).
+config :rockbox, exec_cache_enabled: false

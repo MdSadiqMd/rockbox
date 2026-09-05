@@ -13,6 +13,11 @@ config :rockbox, :engine,
   binary: System.get_env("ROCKBOX_ENGINE_BIN") || "core/target/release/engine",
   data_socket_dir: System.get_env("ROCKBOX_DATA_SOCK_DIR") || "/tmp/rockbox-data"
 
+# Loop27: the RL stepping endpoints negotiate raw-bytes ticks via
+# `Accept: application/msgpack` (SDK default). Register the type so the
+# `:accepts` plug lets it through instead of 406ing before the action runs.
+config :mime, :types, %{"application/msgpack" => ["msgpack"]}
+
 config :rockbox,
   episodes_root: System.get_env("ROCKBOX_EPISODES_ROOT") || "/var/lib/sandbox/episodes",
   episode_routes_path:
