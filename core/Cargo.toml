@@ -94,7 +94,7 @@ redundant_clone = "warn"
 type_complexity = "allow"
 
 [profile.release]
-lto           = "thin"
+lto           = "fat"
 codegen-units = 1
 strip         = true
 panic         = "abort"
