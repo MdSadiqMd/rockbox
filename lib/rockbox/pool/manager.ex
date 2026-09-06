@@ -22,6 +22,12 @@ defmodule Rockbox.Pool.Manager do
   alias Rockbox.Settings.Effective
 
   @table :rockbox_pool
+  @idx_table :rockbox_pool_idx
+  # SOTA Loop21 secondary index (bag): `{pool_key, vm_id, ts}` for idle VMs.
+  # OTP efficiency guide: `select` over `match_object`, and a home-brew index
+  # beats full-table scans. Take is `lookup(key)` (O(bucket), not O(pool))
+  # + atomic `:ets.take` per candidate — no sentinel row, no per-bucket
+  # serialisation, losers try the next candidate instead of cold-spawning.
 
   def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
 
@@ -92,7 +98,23 @@ defmodule Rockbox.Pool.Manager do
 
   @impl true
   def init(_) do
-    :ets.new(@table, [:named_table, :public, read_concurrency: true])
+    :ets.new(@table, [
+      :named_table,
+      :public,
+      read_concurrency: true,
+      write_concurrency: true,
+      decentralized_counters: true
+    ])
+
+    :ets.new(@idx_table, [
+      :named_table,
+      :public,
+      :bag,
+      read_concurrency: true,
+      write_concurrency: true,
+      decentralized_counters: true
+    ])
+
     {:ok, %{}}
   end
 
@@ -134,10 +156,11 @@ defmodule Rockbox.Pool.Manager do
         # the concurrency cap for future spawns.
         QuotaTracker.release(s.workspace_id)
 
-        :ets.insert(
-          @table,
-          {vm_id, %{key: pool_key(s), state: :idle, ts: System.system_time(:millisecond)}}
-        )
+        now = System.system_time(:millisecond)
+        key = pool_key(s)
+
+        :ets.insert(@table, {vm_id, %{key: key, state: :idle, ts: now}})
+        :ets.insert(@idx_table, {key, vm_id, now})
     end
 
     {:noreply, state}
@@ -152,6 +175,8 @@ defmodule Rockbox.Pool.Manager do
     end
 
     :ets.delete(@table, vm_id)
+    # Rare path (crash/kill/OOM): index cleanup by scan is fine.
+    :ets.match_delete(@idx_table, {:_, vm_id, :_})
     {:noreply, state}
   end
 
@@ -164,7 +189,7 @@ defmodule Rockbox.Pool.Manager do
       |> Enum.sort_by(fn {_vm, entry} -> entry.ts end)
       |> Enum.take(count)
 
-    Enum.each(victims, fn {vm_id, _ts} ->
+    Enum.each(victims, fn {vm_id, entry} ->
       Logger.debug("autoscaler retire vm_id=#{vm_id} key=#{inspect(key)}")
 
       case key do
@@ -176,6 +201,7 @@ defmodule Rockbox.Pool.Manager do
       end
 
       :ets.delete(@table, vm_id)
+      :ets.delete_object(@idx_table, {key, vm_id, entry.ts})
       Rockbox.VM.Supervisor.stop_vm(vm_id, :autoscale_retire)
     end)
 
@@ -195,48 +221,54 @@ defmodule Rockbox.Pool.Manager do
   @doc false
   # Atomically claim one idle VM from the bucket `key`.
   #
-  # Claim specs built on `select_replace`/`select_delete`/`select` reject
-  # map-pattern heads in this OTP (tuple-construction bodies with map heads
-  # are mis-compiled), so the claim uses a sentinel row instead: `insert_new`
-  # succeeds for exactly one process, serialising the scan+take for the
-  # bucket; concurrent acquirers see the sentinel, return `:empty`, and take
-  # the cold-spawn path. Returns `{:ok, vm_id, ts}` — the row is REMOVED
-  # from the table, so the caller must either `mark_busy/2` or re-insert the
-  # idle row. Returns `:empty` when the bucket is empty or the only
-  # candidate is stale (in which case it is destroyed, outside the acquire
-  # call, so terminating the engine never blocks other workspaces).
+  # SOTA Loop21: bucket-indexed take. `lookup(key)` on the bag index returns
+  # only this bucket's idle VMs (O(bucket), oldest first) instead of
+  # `match_object`-scanning the whole pool (O(pool)); each candidate is
+  # claimed with atomic `:ets.take`, so concurrent acquirers race per-VM —
+  # exactly one wins each VM and losers try the next candidate. No sentinel
+  # row, no per-bucket serialisation, no spurious cold spawns under
+  # contention. Stale (TTL-expired) candidates are destroyed async and
+  # skipped, not terminal: one expired VM no longer forces `:empty` when
+  # fresher idle VMs exist. Index/main races (retire, vm_dead interleavings)
+  # degrade to trying the next candidate — never to a wrong VM, since `take`
+  # verifies `%{key: ^key, state: :idle}` before returning.
+  # Returns `{:ok, vm_id, ts}` — the row is REMOVED from the table, so the
+  # caller must either `mark_busy/2` or re-insert the idle row. Returns
+  # `:empty` when the bucket has no live idle VM.
   def take_idle(key, ttl_ms) do
-    claim = {:__claim__, %{key: key, state: :claimed, ts: System.system_time(:millisecond)}}
-
-    case :ets.insert_new(@table, claim) do
-      true ->
-        try do
-          take_idle_locked(key, ttl_ms)
-        after
-          :ets.delete(@table, :__claim__)
-        end
-
-      false ->
+    case :ets.lookup(@idx_table, key) do
+      [] ->
         :empty
+
+      candidates ->
+        candidates
+        |> Enum.sort_by(fn {_k, _vm, ts} -> ts end)
+        |> take_candidate(key, ttl_ms)
     end
   end
 
-  defp take_idle_locked(key, ttl_ms) do
-    case :ets.match_object(@table, {:"$1", %{key: key, state: :idle, ts: :"$2"}}, 1) do
-      {[{vm_id, entry}], _} ->
-        :ets.delete(@table, vm_id)
+  defp take_candidate([], _key, _ttl_ms), do: :empty
+
+  defp take_candidate([{key, vm_id, ts} | rest], key, ttl_ms) do
+    case :ets.take(@table, vm_id) do
+      [{^vm_id, %{key: ^key, state: :idle} = entry}] ->
+        :ets.delete_object(@idx_table, {key, vm_id, ts})
 
         if ttl_ms > 0 and stale?(entry.ts, ttl_ms) do
           # Idle past its TTL: destroy instead of reusing, so exec-mode
-          # warm VMs cannot leak indefinitely.
+          # warm VMs cannot leak indefinitely. Keep scanning: a stale head
+          # must not hide fresher idle VMs behind it.
           spawn(fn -> Rockbox.VM.Supervisor.stop_vm(vm_id, :idle_ttl_expired) end)
-          :empty
+          take_candidate(rest, key, ttl_ms)
         else
           {:ok, vm_id, entry.ts}
         end
 
       _ ->
-        :empty
+        # Lost the race (retired, died, or taken): drop the stale index
+        # entry and try the next candidate.
+        :ets.delete_object(@idx_table, {key, vm_id, ts})
+        take_candidate(rest, key, ttl_ms)
     end
   end
 
@@ -257,7 +289,9 @@ defmodule Rockbox.Pool.Manager do
   end
 
   defp spawn_vm(%Effective{} = s) do
-    vm_id = "vm_" <> (:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower))
+    # Cold path only: monotonic seqnum avoids a CSPRNG round trip per spawn
+    # (same rationale as `VM.Server.new_request_id/0`, Loop20).
+    vm_id = "vm_" <> Integer.to_string(System.unique_integer([:positive, :monotonic]), 36)
 
     case Rockbox.VM.Supervisor.start_vm(%{
            vm_id: vm_id,
