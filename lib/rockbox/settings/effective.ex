@@ -34,7 +34,7 @@ defmodule Rockbox.Settings.Effective do
     :clamped
   ]
 
-  defstruct @enforce_keys ++ [strict: false]
+  defstruct @enforce_keys ++ [strict: false, cache_key: nil]
 
   @typedoc """
   A frozen Settings struct — never mutated after `Pipeline.run/2` returns.
@@ -51,7 +51,7 @@ defmodule Rockbox.Settings.Effective do
           mode: atom(),
           limits: map(),
           lifecycle: map(),
-          capabilities: [atom()],
+          capabilities: [atom() | String.t()],
           network: map(),
           filesystem: map(),
           env: %{String.t() => String.t()},
@@ -63,9 +63,11 @@ defmodule Rockbox.Settings.Effective do
           cost: map(),
           labels: %{String.t() => String.t()},
           session_id: String.t() | nil,
-          stdin: binary() | nil,
           clamped: [map()],
-          strict: boolean()
+          strict: boolean(),
+          # SOTA Loop22: frozen content hash (`ExecCache.cache_key/1`),
+          # attached by `Pipeline.freeze/4` when cacheable, else nil.
+          cache_key: binary() | nil
         }
 
   @doc """
@@ -73,30 +75,44 @@ defmodule Rockbox.Settings.Effective do
   enum atoms are stringified, file `content` is sent as raw bytes.
   """
   def to_wire(%__MODULE__{} = s) do
-    %{
-      "schema" => Rockbox.Wire.schema_version(),
-      "request_id" => s.request_id,
-      "labels" => s.labels,
-      "language" => Atom.to_string(s.language),
-      "runtime" => s.runtime,
-      "files" => Enum.map(s.files, &file_to_wire/1),
-      "entrypoint" => s.entrypoint,
-      "mode" => Atom.to_string(s.mode),
-      "session_id" => s.session_id,
-      "limits" => s.limits,
-      "lifecycle" => s.lifecycle,
-      "capabilities" => Enum.map(s.capabilities, &Atom.to_string/1),
-      "network" => s.network,
-      "filesystem" => s.filesystem,
-      "env" => s.env,
-      "resolved_secrets" => s.resolved_secrets,
-      "stdin" => s.stdin,
-      "determinism" => s.determinism,
-      "gpu" => s.gpu,
-      "output" => s.output,
-      "observability" => s.observability,
-      "cost" => s.cost
-    }
+    # SOTA Loop20: one hash per build. Old path hashed twice on miss
+    # (`WireCache.get` + `WireCache.put` each hashed). Now the key is
+    # computed once and threaded through both.
+    key = Rockbox.ExecCache.key(s)
+
+    case Rockbox.WireCache.get_with_key(s, key) do
+      {:ok, wire} ->
+        wire
+
+      :miss ->
+        wire = %{
+          "schema" => Rockbox.Wire.schema_version(),
+          "request_id" => s.request_id,
+          "labels" => s.labels,
+          "language" => Atom.to_string(s.language),
+          "runtime" => s.runtime,
+          "files" => Enum.map(s.files, &file_to_wire/1),
+          "entrypoint" => s.entrypoint,
+          "mode" => Atom.to_string(s.mode),
+          "session_id" => s.session_id,
+          "limits" => s.limits,
+          "lifecycle" => s.lifecycle,
+          "capabilities" => Enum.map(s.capabilities, &wire_cap/1),
+          "network" => s.network,
+          "filesystem" => s.filesystem,
+          "env" => s.env,
+          "resolved_secrets" => s.resolved_secrets,
+          "stdin" => s.stdin,
+          "determinism" => s.determinism,
+          "gpu" => s.gpu,
+          "output" => s.output,
+          "observability" => s.observability,
+          "cost" => s.cost
+        }
+
+        Rockbox.WireCache.put_with_key(s, wire, key)
+        wire
+    end
   end
 
   defp file_to_wire(%{} = f) do
@@ -106,4 +122,9 @@ defmodule Rockbox.Settings.Effective do
       "mode" => f["mode"] || f[:mode] || 0o644
     }
   end
+
+  # Pipeline freezes capabilities as strings ("concurrency"); hand-built
+  # structs (benches, tests) use atoms. The engine wants strings either way.
+  defp wire_cap(a) when is_atom(a), do: Atom.to_string(a)
+  defp wire_cap(s) when is_binary(s), do: s
 end

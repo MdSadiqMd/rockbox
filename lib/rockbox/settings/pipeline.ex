@@ -92,7 +92,7 @@ defmodule Rockbox.Settings.Pipeline do
   defp maybe_audit(fun, eff) when is_function(fun, 1), do: fun.(eff)
 
   defp freeze(s, ctx, request_id, clamp_log) do
-    %Effective{
+    eff = %Effective{
       request_id: request_id,
       workspace_id: ctx.workspace_id,
       tier: ctx.tier,
@@ -119,6 +119,16 @@ defmodule Rockbox.Settings.Pipeline do
       clamped: Enum.reverse(clamp_log),
       strict: s[:strict] || false
     }
+
+    # SOTA Loop22: freeze the content hash once. The exec path (ExecCache
+    # get+put) and the wire path (`Effective.to_wire`) share it via
+    # `ExecCache.key/1` — zero rehash downstream, even for 64KB programs
+    # where one hash costs ~22µs. Non-cacheable requests skip the hash.
+    if Rockbox.ExecCache.cacheable?(eff) do
+      %{eff | cache_key: Rockbox.ExecCache.cache_key(eff)}
+    else
+      eff
+    end
   end
 
   defp default_entrypoint(%{language: :python}), do: "main.py"
