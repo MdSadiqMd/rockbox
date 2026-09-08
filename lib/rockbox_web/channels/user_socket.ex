@@ -3,6 +3,7 @@ defmodule RockboxWeb.UserSocket do
 
   channel("vm:*", RockboxWeb.VMChannel)
   channel("session:*", RockboxWeb.SessionChannel)
+  channel("episode:*", RockboxWeb.EpisodeChannel)
 
   @impl true
   def connect(%{"token" => token}, socket, _connect_info) do

@@ -2,7 +2,9 @@ defmodule RockboxWeb.Router do
   use Phoenix.Router
 
   pipeline :api do
-    plug(:accepts, ["json"])
+    # "msgpack" covers the RL step/steps raw-bytes negotiation; every other
+    # action renders explicit JSON, so widening the gate changes nothing else.
+    plug(:accepts, ["json", "msgpack"])
     plug(RockboxWeb.Plugs.Authenticate)
     plug(RockboxWeb.Plugs.RateLimit)
   end
