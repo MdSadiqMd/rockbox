@@ -25,12 +25,11 @@ defmodule Rockbox.Application do
         Rockbox.QuotaTracker,
         Rockbox.SecretsBroker,
         Rockbox.AuditLog,
-        Rockbox.WebhookDispatcher,
         Rockbox.SessionRouter,
         Rockbox.EpisodeRegistry,
         Rockbox.ApiKeys.Cache,
+        Rockbox.ExecCache,
         Rockbox.Environments.Builder,
-
         # VM lifecycle
         Rockbox.VM.Registry,
         Rockbox.VM.Supervisor,
