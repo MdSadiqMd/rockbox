@@ -12,7 +12,7 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: rockbox_dev
     ports:
-      - "5433:5432"
+      - "${ROCKBOX_PG_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -54,7 +54,9 @@ services:
       engine-watch:
         condition: service_started
     ports:
-      - "4000:4000"
+      # Guest-side publish is env-tunable so a second project-VM can coexist
+      # with other Lima instances that own the default host ports
+      - "${ROCKBOX_API_PORT:-4000}:4000"
     # Sandbox needs CAP_SYS_ADMIN (unshare namespaces, mount, cgroup write),
     # an unconfined host AppArmor (we ship our own profiles inside), and an
     # unconfined host seccomp (the docker default blocks clone3+CLONE_NEWUSER).
@@ -70,8 +72,11 @@ services:
       - deps_cache:/app/deps
       - build_cache:/app/_build
       - target_cache:/app/core/target
+      - sandbox_cache:/var/cache/sandbox
+      - episodes_data:/var/lib/sandbox/episodes
+      - episode_routes:/var/lib/rockbox
     environment:
-      MIX_ENV: dev
+      MIX_ENV: bench
       PHX_HOST: localhost
       PGHOST: postgres
       PGUSER: postgres
@@ -79,6 +84,17 @@ services:
       PGDATABASE: rockbox_dev
       ROCKBOX_ENGINE_BIN: /app/core/target/debug/engine
       ROCKBOX_DATA_SOCK_DIR: /tmp/rockbox-data
+      ROCKBOX_ENGINE_LOG: debug
+      # Latency tuning: schedulers spin for work instead of sleeping, cutting
+      # wakeup latency on the GenServer/port hops that sit between HTTP and
+      # the engine. Costs idle CPU — right trade-off for an execution API.
+      ERL_AFLAGS: "+sbwt very_long +sbwtdcpu very_long +sbwtdio very_long"
+      ROCKBOX_CHILD_DIAG: "1"
+      WORKSPACE_CONCURRENCY: "200"
+      RATE_BURST: "2000"
+      RATE_PER_S: "500"
+      # Bench-only admin token for the /api/admin provisioning surface
+      ROCKBOX_ADMIN_TOKEN: "bench-admin-token"
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:4000/health >/dev/null"]
       interval: 5s
@@ -93,3 +109,6 @@ volumes:
   cargo_cache:
   cargo_git:
   target_cache:
+  sandbox_cache:
+  episodes_data:
+  episode_routes:
