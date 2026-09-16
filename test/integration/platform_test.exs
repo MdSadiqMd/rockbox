@@ -49,11 +49,12 @@ defmodule Rockbox.Integration.PlatformTest do
     end
 
     test "rl_step builds correct command" do
-      action = Base.encode64(<<0>>)
-      cmd = Rockbox.Wire.rl_step("req_1", "ep_1", action)
+      # Action frames are raw bytes (the controller base64-decodes client
+      # input first); Wire packs them as msgpack bin for the engine.
+      cmd = Rockbox.Wire.rl_step("req_1", "ep_1", <<0>>)
       assert cmd["cmd"] == "rl_step"
       assert cmd["episode_id"] == "ep_1"
-      assert cmd["action"] == action
+      assert %Msgpax.Bin{data: <<0>>} = cmd["action"]
     end
 
     test "stdin builds correct command" do
@@ -374,6 +375,7 @@ defmodule Rockbox.Integration.PlatformTest do
     test "lookup returns entry for known runtimes" do
       assert %{} = RuntimeCatalog.lookup("python-base")
       assert %{} = RuntimeCatalog.lookup("ts-modern")
+      assert %{} = RuntimeCatalog.lookup("ts-bun")
       assert %{} = RuntimeCatalog.lookup("go-std")
       assert %{} = RuntimeCatalog.lookup("rust-tokio")
       assert %{} = RuntimeCatalog.lookup("cpp-modern")
@@ -385,7 +387,7 @@ defmodule Rockbox.Integration.PlatformTest do
 
     test "default_for returns correct runtime per language" do
       assert RuntimeCatalog.default_for(:python).name == "python-base"
-      assert RuntimeCatalog.default_for(:typescript).name == "ts-modern"
+      assert RuntimeCatalog.default_for(:typescript).name == "ts-bun"
       assert RuntimeCatalog.default_for(:go).name == "go-std"
     end
 
@@ -527,6 +529,83 @@ defmodule Rockbox.Integration.PlatformTest do
           # Acceptable — engine binary might not be ready
           flunk("Pool acquire failed: #{inspect(reason)}")
       end
+    end
+  end
+
+  # Pool Manager accounting (no engine required — manipulate the pool ETS)
+  describe "Pool Manager accounting" do
+    alias Rockbox.Pool.Manager
+    alias Rockbox.QuotaTracker
+
+    setup do
+      :ets.match_object(:rockbox_pool, {:"$1", :_})
+      |> Enum.each(fn {vm_id, _attrs} -> :ets.delete(:rockbox_pool, vm_id) end)
+
+      :ok
+    end
+
+    defp entry(ws, language, mode, state) do
+      key = {ws, language, "runtime-x", mode, nil}
+      %{key: key, state: state, ts: System.system_time(:millisecond)}
+    end
+
+    test "vm_dead releases quota for a busy VM and drops it from the pool" do
+      ws = "pool-acct-busy-ws"
+      QuotaTracker.reserve(ws)
+
+      :ets.insert(:rockbox_pool, {"vm_dead_busy", entry(ws, "python", :exec, :busy)})
+
+      Manager.vm_dead("vm_dead_busy", ws)
+      Process.sleep(50)
+
+      assert QuotaTracker.in_flight(ws) == 0
+      assert :ets.lookup(:rockbox_pool, "vm_dead_busy") == []
+    end
+
+    test "vm_dead does not double-release for an idle pooled VM" do
+      ws = "pool-acct-idle-ws"
+      QuotaTracker.reserve(ws)
+
+      # The idle VM released its slot when it entered the pool; the fresh
+      # acquire in flight holds the one remaining slot.
+      :ets.insert(:rockbox_pool, {"vm_dead_idle", entry(ws, "python", :reusable, :idle)})
+
+      Manager.vm_dead("vm_dead_idle", ws)
+      Process.sleep(50)
+
+      assert QuotaTracker.in_flight(ws) == 1
+      assert :ets.lookup(:rockbox_pool, "vm_dead_idle") == []
+    end
+
+    test "vm_dead is idempotent for unknown vm_ids" do
+      ws = "pool-acct-unknown-ws"
+      assert QuotaTracker.in_flight(ws) == 0
+      Manager.vm_dead("vm_unknown", ws)
+      assert QuotaTracker.in_flight(ws) == 0
+    end
+
+    test "retire leaves busy VMs alone and retires oldest idle first" do
+      ws = "pool-retire-ws"
+      key = {ws, "python", "runtime-x", :reusable, nil}
+
+      :ets.insert(:rockbox_pool, {"vm-busy", entry(ws, "python", :exec, :busy)})
+
+      :ets.insert(
+        :rockbox_pool,
+        {"vm-idle-old", entry(ws, "python", :reusable, :idle) |> Map.put(:ts, 1)}
+      )
+
+      :ets.insert(
+        :rockbox_pool,
+        {"vm-idle-new", entry(ws, "python", :reusable, :idle) |> Map.put(:ts, 9_999_999_999)}
+      )
+
+      Manager.retire(key, 1)
+      Process.sleep(50)
+
+      assert :ets.lookup(:rockbox_pool, "vm-busy") != []
+      assert :ets.lookup(:rockbox_pool, "vm-idle-new") != []
+      assert :ets.lookup(:rockbox_pool, "vm-idle-old") == []
     end
   end
 
