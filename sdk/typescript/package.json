@@ -1,0 +1,22 @@
+{
+  "name": "rockbox-sdk",
+  "version": "0.1.0",
+  "description": "Rockbox sandbox-as-a-service TypeScript SDK — one-shot execution, persistent sessions, RL episodes with batched stepping, file operations. Zero dependencies.",
+  "main": "rockbox-sdk.ts",
+  "types": "rockbox-sdk.ts",
+  "files": [
+    "rockbox-sdk.ts"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "sandbox",
+    "rl",
+    "reinforcement-learning",
+    "gymnasium",
+    "code-execution",
+    "agents"
+  ],
+  "license": "Apache-2.0"
+}
