@@ -68,6 +68,17 @@ defmodule Rockbox.Wire do
     }
   end
 
+  @doc """
+  Ask the live worker to checkpoint its env state now (fork / pause). The
+  engine answers with an `rl_step` frame carrying `info["snapshot"]`.
+  """
+  def rl_snapshot(id, episode_id),
+    do: %{"cmd" => "rl_snapshot", "id" => id, "episode_id" => episode_id}
+
+  @doc "End an episode's worker but keep the engine alive for the next one."
+  def rl_close(id, episode_id),
+    do: %{"cmd" => "rl_close", "id" => id, "episode_id" => episode_id}
+
   def stdin(data) when is_binary(data), do: %{"cmd" => "stdin", "data" => data}
   def interrupt(id), do: %{"cmd" => "interrupt", "id" => id}
   def shutdown, do: %{"cmd" => "shutdown"}

@@ -40,6 +40,43 @@ defmodule Rockbox.EpisodeStore do
   end
 
   @doc """
+  Clone an episode's durable state into a fresh episode directory so a new
+  worker started for `child_id` resumes from the parent's checkpoint (the
+  engine sees a manifest and boots in resume mode). Only the manifest and
+  checkpoint are copied — user files under the volume stay with the parent.
+  """
+  @spec clone_episode(String.t(), String.t()) :: :ok | {:error, term()}
+  def clone_episode(parent_id, child_id) do
+    src = Path.join(root(), parent_id)
+    dst = Path.join(root(), child_id)
+
+    with {:ok, manifest} <- fetch_settings(parent_id),
+         :ok <- File.mkdir_p(dst),
+         # The engine created the parent dir 0777 so the sandboxed worker
+         # (uid 65534) can write its checkpoint; the child needs the same.
+         :ok <- File.chmod(dst, 0o777),
+         :ok <-
+           File.write(
+             Path.join(dst, "manifest.json"),
+             Jason.encode!(Map.put(manifest, "request_id", child_id))
+           ) do
+      state = Path.join(src, "state.pkl")
+
+      if File.regular?(state) do
+        case File.cp(state, Path.join(dst, "state.pkl")) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:copy_state, reason}}
+        end
+      else
+        :ok
+      end
+    else
+      :error -> {:error, :no_manifest}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Remove an episode's durable state (checkpoint + manifest). Called on
   explicit client destroy — after this the episode can no longer be resumed.
   """
