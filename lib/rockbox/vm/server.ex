@@ -104,6 +104,32 @@ defmodule Rockbox.VM.Server do
   end
 
   @doc """
+  Force the episode worker to write its checkpoint now and block for the
+  ack. The engine replies with an `rl_step` frame, so it parks on the same
+  direct-reply path as a step; `info["snapshot"]` says whether the env
+  supports save().
+  """
+  def rl_snapshot_wait(vm_id, episode_id, timeout \\ 15_000) do
+    call(
+      vm_id,
+      {:rl_step_wait, Rockbox.Wire.rl_snapshot(new_request_id(), episode_id)},
+      timeout
+    )
+  end
+
+  @doc """
+  Kill the episode's worker and block for the ack. The engine survives and
+  goes back to the pool, so the next episode skips the engine boot.
+  """
+  def rl_close_wait(vm_id, episode_id, timeout \\ 15_000) do
+    call(
+      vm_id,
+      {:rl_step_wait, Rockbox.Wire.rl_close(new_request_id(), episode_id)},
+      timeout
+    )
+  end
+
+  @doc """
   Send an EnvPool-style batched `rl_steps` command: N actions pipelined
   through the engine in one round trip, every tick returned in one response.
   """
@@ -355,6 +381,11 @@ defmodule Rockbox.VM.Server do
 
   defp handle_response(%{"type" => "ready"} = msg, state) do
     Phoenix.PubSub.broadcast(Rockbox.PubSub, "vm:#{state.vm_id}", {:ready, msg})
+
+    boot_ms = System.system_time(:millisecond) - state.started_at
+    :telemetry.execute([:rockbox, :vm, :ready], %{boot_ms: boot_ms}, %{mode: state.mode})
+    Logger.debug("[vm #{state.vm_id}] engine ready in #{boot_ms}ms")
+
     %{state | status: :idle}
   end
 

@@ -25,7 +25,7 @@ defmodule Rockbox.EpisodeRegistry do
 
   defmodule Route do
     @enforce_keys [:episode_id, :vm_id]
-    defstruct [:episode_id, :vm_id, :workspace_id, :tier, :created_at, :last_seen]
+    defstruct [:episode_id, :vm_id, :workspace_id, :tier, :settings, :created_at, :last_seen]
   end
 
   def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
@@ -53,9 +53,21 @@ defmodule Rockbox.EpisodeRegistry do
     end
   end
 
-  @doc "Register (or refresh) the episode → vm mapping."
-  def register(episode_id, vm_id, workspace_id, tier \\ :pro),
-    do: GenServer.call(__MODULE__, {:register, episode_id, vm_id, workspace_id, tier})
+  @doc """
+  Register (or refresh) the episode → vm mapping. `settings` is the frozen
+  `%Effective{}` the episode was started with; teardown hands it to
+  `Pool.release/2` so the engine goes back to the right pool bucket.
+  """
+  def register(episode_id, vm_id, workspace_id, tier \\ :pro, settings \\ nil),
+    do: GenServer.call(__MODULE__, {:register, episode_id, vm_id, workspace_id, tier, settings})
+
+  @doc "The frozen settings recorded at register time, or nil for legacy routes."
+  def lookup_settings(episode_id) do
+    case :ets.lookup(@table, episode_id) do
+      [{_, %Route{settings: s}}] -> s
+      _ -> nil
+    end
+  end
 
   @doc "Forget the mapping (called on episode destroy / engine death)."
   def forget(episode_id), do: GenServer.call(__MODULE__, {:forget, episode_id})
@@ -108,7 +120,7 @@ defmodule Rockbox.EpisodeRegistry do
   end
 
   @impl true
-  def handle_call({:register, eid, vm_id, wid, tier}, _from, state) do
+  def handle_call({:register, eid, vm_id, wid, tier, settings}, _from, state) do
     now = System.system_time(:millisecond)
 
     route = %Route{
@@ -116,6 +128,7 @@ defmodule Rockbox.EpisodeRegistry do
       vm_id: vm_id,
       workspace_id: wid,
       tier: tier,
+      settings: settings,
       created_at: now,
       last_seen: now
     }
