@@ -793,7 +793,7 @@ fn cpp_toolchain_lib_dirs(compiler: &Path) -> &'static [String] {
 }
 
 #[cfg(test)]
-mod cache_key_tests {
+pub(crate) mod cache_key_tests {
     use super::*;
     use protocol::settings::{
         CostSettings, Determinism, DnsSettings, FileEntry, FilesystemSettings, GpuSettings,
@@ -801,7 +801,7 @@ mod cache_key_tests {
         OutputAction, OutputSettings,
     };
 
-    fn minimal_settings() -> Settings {
+    pub(crate) fn minimal_settings() -> Settings {
         Settings {
             schema: "v1".to_string(),
             request_id: "req_test".to_string(),

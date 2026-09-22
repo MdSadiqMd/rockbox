@@ -39,6 +39,10 @@ pub struct EngineState {
     /// LSP language-server child pool, keyed by language. Servers are
     /// long-lived and reused across relay() calls; killed on engine shutdown.
     pub lsp_servers: Mutex<std::collections::HashMap<Language, Arc<crate::modes::lsp::LspServer>>>,
+    /// RL worker booted ahead of the next episode (interpreter + shim up,
+    /// user module not loaded). An async mutex so a claim waits for an
+    /// in-flight prespawn instead of falling back to a cold boot.
+    pub warm_worker: tokio::sync::Mutex<Option<crate::modes::rl::WarmWorker>>,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -90,6 +94,7 @@ impl EngineState {
             sessions: Mutex::new(std::collections::HashMap::new()),
             episodes: Mutex::new(std::collections::HashMap::new()),
             lsp_servers: Mutex::new(std::collections::HashMap::new()),
+            warm_worker: tokio::sync::Mutex::new(None),
         }
     }
 
