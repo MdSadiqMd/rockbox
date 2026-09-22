@@ -56,12 +56,17 @@ use std::collections::BTreeMap;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 use tracing::{debug, info, warn};
 
 const EPISODES_ROOT: &str = "/var/lib/sandbox/episodes";
 const STATE_FILE: &str = "state.pkl";
+/// Action-frame header value the shim treats as "snapshot now" instead of a
+/// byte count. Real actions are capped far below this by the pipe protocol.
+const SNAPSHOT_SENTINEL: u32 = u32::MAX;
 const MANIFEST_FILE: &str = "manifest.json";
 const SHIM_FILENAME: &str = ".rockbox_rl_worker.py";
 
@@ -116,6 +121,224 @@ enum StepOutcome {
     Dead(String),
 }
 
+/// A worker booted ahead of demand: interpreter + shim are up and blocked on
+/// the JSON load frame that names the user module (see `PRESPAWN` in the
+/// shim). Only an episode whose sandbox-relevant settings hash to the same
+/// `fingerprint` may claim it; anything else takes the cold path.
+pub struct WarmWorker {
+    worker: Worker,
+    /// Provisional episode volume (`EPISODES_ROOT/.warm-<pid>-<n>`) bound RW
+    /// at /episode. Claiming renames it onto the real episode directory — a
+    /// bind mount follows the dentry, so the worker keeps seeing the same
+    /// directory under its new name.
+    dir: PathBuf,
+    fingerprint: [u8; 32],
+}
+
+impl std::fmt::Debug for WarmWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarmWorker")
+            .field("dir", &self.dir)
+            .finish()
+    }
+}
+
+static WARM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn prespawn_enabled() -> bool {
+    std::env::var("ROCKBOX_RL_PRESPAWN")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// Hash of everything that shapes the worker sandbox (runtime, limits,
+/// capabilities, network, mounts, user env) — deliberately NOT the user
+/// files, entry, seed, wall clock or request id, which the load frame
+/// supplies per episode.
+fn shape_fingerprint(s: &Settings) -> [u8; 32] {
+    let mut t = s.clone();
+    t.request_id.clear();
+    t.files.clear();
+    t.entrypoint.clear();
+    t.stdin = None;
+    t.resolved_secrets.clear();
+    t.labels.clear();
+    t.determinism.seed = None;
+    t.limits.wall_ms = 0;
+    t.env.retain(|k, _| !k.starts_with("ROCKBOX_EPISODE_"));
+    let bytes = serde_json::to_vec(&t).unwrap_or_default();
+    *blake3::hash(&bytes).as_bytes()
+}
+
+/// Boot the next warm worker in the background using `template` for the
+/// sandbox shape. Holds the slot's async lock for the whole boot so a claim
+/// arriving mid-boot waits for it instead of paying a cold start.
+fn schedule_prespawn(state: Arc<EngineState>, template: Settings, data: Option<DataChannel>) {
+    if !prespawn_enabled() || state.launcher.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut slot = state.warm_worker.lock().await;
+        if slot.is_some() {
+            return;
+        }
+        sweep_stale_warm_dirs();
+        let name = format!(
+            ".warm-{}-{}",
+            std::process::id(),
+            WARM_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let dir = PathBuf::from(EPISODES_ROOT).join(&name);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!(error = %e, "rl_prespawn_mkdir_failed");
+            return;
+        }
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+        let fingerprint = shape_fingerprint(&template);
+        let t0 = Instant::now();
+        match launch_worker(&state, &template, &name, data.as_ref(), true).await {
+            Ok(worker) => {
+                debug!(boot_ms = %t0.elapsed().as_millis(), "rl_prespawn_ready");
+                *slot = Some(WarmWorker {
+                    worker,
+                    dir,
+                    fingerprint,
+                });
+            }
+            Err(e) => {
+                warn!(error = %e, "rl_prespawn_failed");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+    });
+}
+
+/// Make the warm worker's volume the episode directory. The worker's
+/// /episode is bound to `warm_dir`'s dentry, so anything already durable in
+/// `episode_dir` (manifest, checkpoint, user files of a resume/fork) is moved
+/// into it first; a fresh episode dir is empty and simply gets replaced.
+fn adopt_episode_dir(
+    warm_dir: &std::path::Path,
+    episode_dir: &std::path::Path,
+) -> std::io::Result<()> {
+    if let Ok(entries) = std::fs::read_dir(episode_dir) {
+        for entry in entries.flatten() {
+            std::fs::rename(entry.path(), warm_dir.join(entry.file_name()))?;
+        }
+    }
+    let _ = std::fs::remove_dir(episode_dir);
+    std::fs::rename(warm_dir, episode_dir)
+}
+
+/// Remove `.warm-*` volumes left by engines that are no longer running
+/// (crash / SIGKILL skip the drop path). Once per engine process.
+fn sweep_stale_warm_dirs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(EPISODES_ROOT) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".warm-")) else {
+                continue;
+            };
+            let alive = rest
+                .split('-')
+                .next()
+                .and_then(|pid| pid.parse::<u32>().ok())
+                .is_some_and(|pid| std::path::Path::new(&format!("/proc/{pid}")).exists());
+            if !alive {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+}
+
+/// Try to serve an episode from the warm worker: rename its volume onto
+/// `episode_dir`, ship the user module + per-episode env in the load frame,
+/// run the reset handshake. `None` means take the cold path (no warm worker,
+/// shape mismatch, or the warm worker died) — never an error for the caller.
+async fn claim_warm(
+    state: &Arc<EngineState>,
+    settings: &Settings,
+    episode_id: &str,
+    episode_dir: &std::path::Path,
+    resume: bool,
+    data: Option<&DataChannel>,
+) -> Option<(Worker, Box<Tick>, Vec<u8>)> {
+    if !prespawn_enabled() {
+        return None;
+    }
+    let t0 = Instant::now();
+    let warm = {
+        let mut slot = state.warm_worker.lock().await;
+        match slot.take() {
+            Some(w) if w.fingerprint == shape_fingerprint(settings) => w,
+            Some(w) => {
+                debug!("rl_prespawn_shape_mismatch");
+                let _ = std::fs::remove_dir_all(&w.dir);
+                drop(w);
+                return None;
+            }
+            None => return None,
+        }
+    };
+    let WarmWorker {
+        mut worker, dir, ..
+    } = warm;
+    if let Err(e) = adopt_episode_dir(&dir, episode_dir) {
+        warn!(error = %e, "rl_prespawn_rename_failed");
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    // Keep the next one booting while this episode runs, so churn-heavy
+    // rollouts never wait on interpreter start.
+    schedule_prespawn(state.clone(), settings.clone(), data.cloned());
+
+    let mut env = serde_json::Map::new();
+    env.insert(
+        "ROCKBOX_USER_ENTRY".into(),
+        settings.entrypoint.clone().into(),
+    );
+    env.insert("ROCKBOX_EPISODE_ID".into(), episode_id.into());
+    if let Some(seed) = settings.determinism.seed {
+        env.insert("ROCKBOX_EPISODE_SEED".into(), seed.to_string().into());
+    }
+    if resume {
+        env.insert("ROCKBOX_EPISODE_RESUME".into(), "1".into());
+    }
+    let load = serde_json::json!({
+        "entry": settings.entrypoint,
+        "files": settings.files.iter().filter(|f| f.path != SHIM_FILENAME).map(|f| {
+            serde_json::json!({
+                "path": f.path,
+                "content": base64::engine::general_purpose::STANDARD.encode(&f.content),
+            })
+        }).collect::<Vec<_>>(),
+        "env": env,
+    });
+    let body = load.to_string().into_bytes();
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    let wall_ms = settings.limits.wall_ms;
+    let deadline = Instant::now() + Duration::from_millis(wall_ms.max(1));
+    if write_all_poll(worker.stdin_w.as_raw_fd(), &frame, deadline).is_err() {
+        warn!("rl_prespawn_load_failed");
+        return None;
+    }
+    match reset_handshake(&mut worker, wall_ms, episode_id) {
+        Ok((tick, obs)) => {
+            debug!(claim_ms = %t0.elapsed().as_millis(), "rl_prespawn_claimed");
+            Some((worker, Box::new(tick), obs))
+        }
+        Err(e) => {
+            warn!(error = %e, "rl_prespawn_handshake_failed");
+            None
+        }
+    }
+}
+
 /// Why a pipe operation didn't complete.
 enum PipeFail {
     TimedOut,
@@ -123,7 +346,7 @@ enum PipeFail {
 }
 
 pub async fn start<W: AsyncWrite + Unpin>(
-    state: &EngineState,
+    state: &Arc<EngineState>,
     settings: Settings,
     writer: &FrameWriter<W>,
     data: Option<&DataChannel>,
@@ -198,6 +421,19 @@ pub async fn start<W: AsyncWrite + Unpin>(
     } else {
         let _ = std::fs::remove_file(episode_dir.join(STATE_FILE));
     }
+    // Try the prespawned worker first: its volume becomes the episode dir
+    // (fresh: rename over the empty dir; resume/fork: durable contents are
+    // moved in first), so this must precede the manifest write.
+    let warm = claim_warm(
+        state,
+        &settings,
+        &episode_id,
+        &episode_dir,
+        resume_mode,
+        data,
+    )
+    .await;
+
     if let Err(e) = write_manifest(&manifest_path, &settings) {
         // Manifests are best-effort: without one an episode simply cannot be
         // resurrected after engine death, which is today's behaviour anyway.
@@ -209,7 +445,11 @@ pub async fn start<W: AsyncWrite + Unpin>(
         ws.env.insert("ROCKBOX_EPISODE_RESUME".into(), "1".into());
     }
 
-    match spawn_worker(state, &ws, &episode_id, data).await {
+    let spawned = match warm {
+        Some(ready) => Ok(ready),
+        None => spawn_worker(state, &ws, &episode_id, data).await,
+    };
+    match spawned {
         Ok((worker, tick, initial_obs)) => {
             let created_at_ms = now_ms();
             state.episodes.lock().insert(
@@ -441,6 +681,144 @@ pub async fn step<W: AsyncWrite + Unpin>(
             .await
         }
     }
+}
+
+/// Force the live worker to checkpoint now (fork / pause). Answers with an
+/// `RlStep` frame so the orchestrator's direct-reply path handles it like a
+/// step; `info["snapshot"]` is `"true"` or `"unsupported"`. The worker stays
+/// alive and its metrics are untouched — a snapshot is not a step.
+pub async fn snapshot<W: AsyncWrite + Unpin>(
+    state: &EngineState,
+    id: String,
+    episode_id: String,
+    writer: &FrameWriter<W>,
+) -> Result<()> {
+    let (taken, wall_ms) = {
+        let mut map = state.episodes.lock();
+        match map.get_mut(&episode_id) {
+            Some(entry) => (entry.worker.take(), entry.settings.limits.wall_ms),
+            None => (None, 5_000),
+        }
+    };
+    let Some(mut worker) = taken else {
+        return send_step(
+            writer,
+            id,
+            episode_id,
+            Vec::new(),
+            0.0,
+            true,
+            false,
+            false,
+            iter_info([("error", "episode not started")]),
+            None,
+            None,
+        )
+        .await;
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let outcome = worker_snapshot(&mut worker, wall_ms);
+        (worker, outcome)
+    })
+    .await;
+    let (worker, outcome) = match result {
+        Ok((worker, outcome)) => (Some(worker), outcome),
+        Err(e) => (None, StepOutcome::Dead(format!("worker io: {e:#}"))),
+    };
+
+    match outcome {
+        StepOutcome::Tick(mut tick) => {
+            let obs = tick.obs.take().unwrap_or_default();
+            let mut info = tick.info.take().unwrap_or_default();
+            if let Some(err) = tick.error.take() {
+                info.entry("error".to_string()).or_insert(err);
+            }
+            {
+                let mut map = state.episodes.lock();
+                if let (Some(entry), Some(worker)) = (map.get_mut(&episode_id), worker) {
+                    entry.worker = Some(worker);
+                }
+            }
+            send_step(
+                writer,
+                id,
+                episode_id,
+                obs,
+                0.0,
+                tick.done,
+                tick.terminated,
+                tick.truncated,
+                info,
+                None,
+                None,
+            )
+            .await
+        }
+        StepOutcome::Timeout | StepOutcome::Dead(_) => {
+            drop(worker);
+            kill_locked(state, &episode_id);
+            let info = match outcome {
+                StepOutcome::Timeout => iter_info([("error", "snapshot timeout")]),
+                StepOutcome::Dead(ref reason) => iter_info([("error", reason.as_str())]),
+                _ => unreachable!(),
+            };
+            send_step(
+                writer,
+                id,
+                episode_id,
+                Vec::new(),
+                0.0,
+                true,
+                true,
+                false,
+                info,
+                None,
+                None,
+            )
+            .await
+        }
+    }
+}
+
+/// End an episode without ending the engine: kill the worker (cgroup kill +
+/// reap) and forget the entry, so the orchestrator can hand this engine to
+/// the next episode instead of paying an engine boot. Acked with an `RlStep`
+/// frame (`info["closed"]`), idempotent for unknown ids.
+pub async fn close<W: AsyncWrite + Unpin>(
+    state: &Arc<EngineState>,
+    id: String,
+    episode_id: String,
+    writer: &FrameWriter<W>,
+    data: Option<&DataChannel>,
+) -> Result<()> {
+    let entry = state.episodes.lock().remove(&episode_id);
+    let had_worker = entry.as_ref().is_some_and(|e| e.worker.is_some());
+    // The closed episode is the best guess for the next one's shape.
+    if let Some(template) = entry.as_ref().map(|e| e.settings.clone()) {
+        schedule_prespawn(state.clone(), template, data.cloned());
+    }
+    // Worker drop blocks on cgroup teardown; keep it off the async thread
+    // and off the episodes lock.
+    if let Some(entry) = entry {
+        tokio::task::spawn_blocking(move || drop(entry))
+            .await
+            .map_err(|e| anyhow::anyhow!("worker close join: {e:#}"))?;
+    }
+    send_step(
+        writer,
+        id,
+        episode_id,
+        Vec::new(),
+        0.0,
+        true,
+        false,
+        false,
+        iter_info([("closed", if had_worker { "true" } else { "already" })]),
+        None,
+        None,
+    )
+    .await
 }
 
 /// EnvPool-style batched stepping: run N sequential steps through one
@@ -747,6 +1125,46 @@ async fn spawn_worker(
     episode_id: &str,
     data: Option<&DataChannel>,
 ) -> Result<(Worker, Box<Tick>, Vec<u8>)> {
+    let mut worker = launch_worker(state, base, episode_id, data, false).await?;
+    let (tick, obs) = reset_handshake(&mut worker, base.limits.wall_ms, episode_id)?;
+    Ok((worker, Box::new(tick), obs))
+}
+
+/// The worker performs reset() on boot and answers with the initial tick.
+/// Empty action == reset in the shim protocol.
+fn reset_handshake(worker: &mut Worker, wall_ms: u64, episode_id: &str) -> Result<(Tick, Vec<u8>)> {
+    let t_handshake = Instant::now();
+    let (tick, obs) = match worker_exchange(worker, b"", wall_ms) {
+        StepOutcome::Tick(mut t) => {
+            let obs = t.obs.take().unwrap_or_default();
+            (*t, obs)
+        }
+        StepOutcome::Dead(reason) => return Err(anyhow!("worker reset failed: {reason}")),
+        StepOutcome::Timeout => {
+            return Err(anyhow!(
+                "worker reset timed out after {}ms",
+                t_handshake.elapsed().as_millis()
+            ));
+        }
+    };
+    debug!(
+        episode_id,
+        handshake_ms = %t_handshake.elapsed().as_millis(),
+        "rl_worker_ready"
+    );
+    Ok((tick, obs))
+}
+
+/// Launch the sandboxed worker process without handshaking. `prespawn`
+/// boots a warm worker: no user files or entry are baked in (the load frame
+/// supplies them later) and `episode_id` names the provisional volume.
+async fn launch_worker(
+    state: &EngineState,
+    base: &Settings,
+    episode_id: &str,
+    data: Option<&DataChannel>,
+    prespawn: bool,
+) -> Result<Worker> {
     let launcher = state
         .launcher
         .as_ref()
@@ -764,7 +1182,11 @@ async fn spawn_worker(
     ws.mode = protocol::Mode::Exec;
     ws.entrypoint = SHIM_FILENAME.to_string();
     ws.request_id = format!("{episode_id}-worker");
-    ws.env.insert("ROCKBOX_USER_ENTRY".into(), user_entry);
+    if prespawn {
+        ws.env.insert("ROCKBOX_PRESPAWN".into(), "1".into());
+    } else {
+        ws.env.insert("ROCKBOX_USER_ENTRY".into(), user_entry);
+    }
     ws.env
         .insert("ROCKBOX_EPISODE_ID".into(), episode_id.to_string());
 
@@ -777,7 +1199,11 @@ async fn spawn_worker(
             .insert("ROCKBOX_EPISODE_SEED".into(), seed.to_string());
     }
 
-    ws.files.retain(|f| f.path != SHIM_FILENAME);
+    if prespawn {
+        ws.files.clear();
+    } else {
+        ws.files.retain(|f| f.path != SHIM_FILENAME);
+    }
     ws.files.insert(
         0,
         FileEntry {
@@ -795,7 +1221,6 @@ async fn spawn_worker(
         });
     }
 
-    let wall = Duration::from_millis(ws.limits.wall_ms);
     let stream_enabled = ws.output.stream;
 
     // Resolve + launch on a blocking thread (same shape as exec mode).
@@ -840,35 +1265,12 @@ async fn spawn_worker(
         spawn_discarder(stderr);
     }
 
-    let mut worker = Worker {
+    Ok(Worker {
         cg,
         _pidfd: pidfd,
         stdin_w,
         proto_r,
-    };
-
-    // Handshake: the worker performs reset() on boot and answers with the
-    // initial tick. Empty action == reset in the shim protocol.
-    let t_handshake = Instant::now();
-    let (tick, obs) = match worker_exchange(&mut worker, b"", wall.as_millis() as u64) {
-        StepOutcome::Tick(mut t) => {
-            let obs = t.obs.take().unwrap_or_default();
-            (*t, obs)
-        }
-        StepOutcome::Dead(reason) => return Err(anyhow!("worker reset failed: {reason}")),
-        StepOutcome::Timeout => {
-            return Err(anyhow!(
-                "worker reset timed out after {}ms",
-                t_handshake.elapsed().as_millis()
-            ));
-        }
-    };
-    debug!(
-        episode_id,
-        handshake_ms = %t_handshake.elapsed().as_millis(),
-        "rl_worker_ready"
-    );
-    Ok((worker, Box::new(tick), obs))
+    })
 }
 
 struct ChildFdParts {
@@ -939,8 +1341,24 @@ fn spawn_discarder(fd: OwnedFd) {
 /// Blocking request/response round-trip against the worker. Runs on a
 /// blocking thread; enforces `wall_ms` via poll timeouts on both directions.
 fn worker_exchange(worker: &mut Worker, action: &[u8], wall_ms: u64) -> StepOutcome {
+    worker_exchange_hdr(worker, action.len() as u32, action, wall_ms)
+}
+
+/// Control request: header carries `SNAPSHOT_SENTINEL` and no action bytes;
+/// the shim force-writes its checkpoint and answers a tick whose
+/// `info["snapshot"]` is `"true"` or `"unsupported"` (env has no save()).
+fn worker_snapshot(worker: &mut Worker, wall_ms: u64) -> StepOutcome {
+    worker_exchange_hdr(worker, SNAPSHOT_SENTINEL, &[], wall_ms)
+}
+
+fn worker_exchange_hdr(
+    worker: &mut Worker,
+    header: u32,
+    action: &[u8],
+    wall_ms: u64,
+) -> StepOutcome {
     let deadline = Instant::now() + Duration::from_millis(wall_ms.max(1));
-    let header = (action.len() as u32).to_be_bytes();
+    let header = header.to_be_bytes();
     let fd = worker.stdin_w.as_raw_fd();
     if action.is_empty() {
         if let Err(fail) = write_all_poll(fd, &header, deadline) {
@@ -1311,13 +1729,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn python_shim_has_prespawn_load_path() {
+        let s = python_shim();
+        assert!(s.contains("PRESPAWN = os.environ.get(\"ROCKBOX_PRESPAWN\") == \"1\""));
+        assert!(s.contains("_load = _json_load.loads(read_exact(_n))"));
+        assert!(s.contains("entry_path = os.path.join(ENV_DIR, _load[\"entry\"])"));
+        // Cold boots keep the original /sandbox entry path.
+        assert!(s.contains(
+            "entry_path = os.path.join(\"/sandbox\", os.environ[\"ROCKBOX_USER_ENTRY\"])"
+        ));
+    }
+
+    #[test]
+    fn shape_fingerprint_ignores_per_episode_fields_only() {
+        let mut a = crate::resolver::spec::cache_key_tests::minimal_settings();
+        a.request_id = "req_a".into();
+        a.entrypoint = "env_a.py".into();
+        a.files = vec![FileEntry {
+            path: "env_a.py".into(),
+            content: b"a".to_vec(),
+            mode: 0o644,
+        }];
+        a.determinism.seed = Some(1);
+        a.limits.wall_ms = 1_000;
+        a.env.insert("ROCKBOX_EPISODE_SEED".into(), "1".into());
+
+        let mut b = a.clone();
+        b.request_id = "req_b".into();
+        b.entrypoint = "env_b.py".into();
+        b.files[0].content = b"totally different".to_vec();
+        b.determinism.seed = Some(2);
+        b.limits.wall_ms = 30_000;
+        b.env.insert("ROCKBOX_EPISODE_SEED".into(), "2".into());
+        assert_eq!(
+            shape_fingerprint(&a),
+            shape_fingerprint(&b),
+            "per-episode fields must not matter"
+        );
+
+        let mut c = a.clone();
+        c.limits.memory_mb += 1;
+        assert_ne!(
+            shape_fingerprint(&a),
+            shape_fingerprint(&c),
+            "cgroup limits shape the sandbox"
+        );
+        let mut d = a.clone();
+        d.env.insert("ROCKBOX_VECTORIZED".into(), "1".into());
+        assert_ne!(
+            shape_fingerprint(&a),
+            shape_fingerprint(&d),
+            "user env shapes the worker"
+        );
+        let mut e = a.clone();
+        e.runtime = Some("python-ml".into());
+        assert_ne!(shape_fingerprint(&a), shape_fingerprint(&e));
+    }
+
+    #[test]
+    fn python_shim_handles_snapshot_sentinel() {
+        // Fork/pause depend on the shim recognising the control header the
+        // engine writes in `worker_snapshot`; the value must render as the
+        // literal integer, not the Rust constant name.
+        let s = python_shim();
+        assert!(s.contains(&format!("SNAPSHOT_SENTINEL = {}", u32::MAX)));
+        assert!(s.contains("snapshot_req = n == SNAPSHOT_SENTINEL"));
+        assert!(s.contains("save_state(force=True)"));
+        assert!(s.contains("\"snapshot\": \"true\" if ok else \"unsupported\""));
+    }
+
+    #[test]
     fn python_shim_contains_protocol_loop() {
         let s = python_shim();
         assert!(s.contains("reset"));
         assert!(s.contains("step"));
         assert!(s.contains(PROTOCOL_MARKER));
         assert!(s.contains("state.pkl"));
-        assert!(!s.contains("base64"));
+        // base64 exists only for the warm-worker load frame (import + one
+        // decode), never on the tick path.
+        assert!(
+            !s.contains("base64."),
+            "base64 module use leaked past the prespawn block"
+        );
+        assert_eq!(s.matches("_b64_load").count(), 2);
         // Gymnasium v2 contract.
         assert!(s.contains("terminated"));
         assert!(s.contains("truncated"));
@@ -1531,7 +2025,7 @@ fn python_shim() -> &'static str {
     static SHIM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SHIM.get_or_init(|| {
         format!(
-        r#"import importlib.util, os, struct, sys
+        r#"import os, struct, sys, types
 
 # {marker}
 EPISODE = "/episode"
@@ -1544,9 +2038,6 @@ PROTO = {proto}
 os.set_blocking(STDIN_FD, True)
 os.set_blocking(PROTO, True)
 
-entry_rel = os.environ["ROCKBOX_USER_ENTRY"]
-entry_path = os.path.join("/sandbox", entry_rel)
-
 def read_exact(n):
     buf = bytearray()
     while len(buf) < n:
@@ -1558,6 +2049,30 @@ def read_exact(n):
 
 def respond(payload):
     os.write(PROTO, len(payload).to_bytes(4, "big") + payload)
+
+PRESPAWN = os.environ.get("ROCKBOX_PRESPAWN") == "1"
+if PRESPAWN:
+    # Warm worker (engine `prespawn`): booted before any episode exists, so
+    # the user module, entry, seed and episode id arrive in one JSON load
+    # frame on the action pipe. Files land on the private tmpfs; the json and
+    # base64 imports happen here, off the episode's critical path.
+    import json as _json_load, base64 as _b64_load
+    _n = int.from_bytes(read_exact(4), "big")
+    _load = _json_load.loads(read_exact(_n))
+    ENV_DIR = "/tmp/.rockbox_env"
+    for _f in _load.get("files", []):
+        _p = os.path.normpath(os.path.join(ENV_DIR, _f["path"]))
+        if not _p.startswith(ENV_DIR + os.sep):
+            raise RuntimeError("bad file path in load frame: " + _f["path"])
+        os.makedirs(os.path.dirname(_p), exist_ok=True)
+        with open(_p, "wb") as _fh:
+            _fh.write(_b64_load.b64decode(_f["content"]))
+    for _k, _v in _load.get("env", {{}}).items():
+        os.environ[_k] = _v
+    sys.path.insert(0, ENV_DIR)
+    entry_path = os.path.join(ENV_DIR, _load["entry"])
+else:
+    entry_path = os.path.join("/sandbox", os.environ["ROCKBOX_USER_ENTRY"])
 
 # Minimal JSON encoder for tick bodies: importing json costs ~5 ms per
 # episode boot (mostly its re dependency) which dominates start latency.
@@ -1663,12 +2178,18 @@ def _pack_tick(reward, done, terminated, truncated, info, error=None):
 
 
 def load_env():
-    spec = importlib.util.spec_from_file_location("user_env", entry_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load user env from {{entry_path}}")
-    mod = importlib.util.module_from_spec(spec)
+    # Plain exec instead of importlib.util: the importlib machinery import
+    # chain costs ~2 ms of a ~10 ms worker boot and /sandbox is read-only so
+    # its .pyc caching could never help anyway.
+    try:
+        with open(entry_path, "rb") as f:
+            src = f.read()
+    except OSError as e:
+        raise RuntimeError(f"cannot load user env from {{entry_path}}: {{e}}")
+    mod = types.ModuleType("user_env")
+    mod.__file__ = entry_path
     sys.modules["user_env"] = mod
-    spec.loader.exec_module(mod)
+    exec(compile(src, entry_path, "exec"), mod.__dict__)
     return mod
 
 mod = load_env()
@@ -1685,6 +2206,7 @@ if VECTORIZED and hasattr(mod, "VectorEnv"):
         HAS_VEC = False
 
 RESUME = os.environ.get("ROCKBOX_EPISODE_RESUME") == "1"
+SNAPSHOT_SENTINEL = {snapshot_sentinel}
 SNAPSHOT_EVERY = int(os.environ.get("ROCKBOX_EPISODE_SNAPSHOT_EVERY", "50"))
 PERSIST_EVERY_STEP = os.environ.get("ROCKBOX_EPISODE_PERSIST_STATE") == "1"
 _step_count = 0
@@ -1803,22 +2325,30 @@ def do_step(action):
         bool(truncated),
         _stringify_info(info),
     )
-def save_state():
+def save_state(force=False):
+    # Returns True when a checkpoint was written. `force` is the engine's
+    # snapshot request (fork/pause) and bypasses the periodic policy.
     if HAS_VEC and hasattr(vec_env, "save"):
         target = vec_env
     elif hasattr(mod, "save"):
         target = mod
     else:
-        return
+        return False
     due = (_step_count % SNAPSHOT_EVERY == 0) if SNAPSHOT_EVERY > 0 else False
-    if not (PERSIST_EVERY_STEP or due or _terminal):
-        return
+    if not (force or PERSIST_EVERY_STEP or due or _terminal):
+        return False
     try:
         import pickle
         with open(STATE, "wb") as f:
             pickle.dump(target.save(), f, protocol=pickle.HIGHEST_PROTOCOL)
+        return True
     except Exception as e:
         print(f"[rockbox] save failed, continuing: {{e}}", file=sys.stderr)
+        return False
+
+def current_obs():
+    target = vec_env if HAS_VEC else mod
+    return as_bytes(target.observe()) if hasattr(target, "observe") else b""
 
 seed = os.environ.get("ROCKBOX_EPISODE_SEED")
 seed = int(seed) if seed is not None else None
@@ -1839,10 +2369,17 @@ while True:
         break
     try:
         n = int.from_bytes(header, "big")
-        action = read_exact(n) if n else b""
+        # Header 0xFFFFFFFF is the engine's control request "snapshot now"
+        # (fork / pause); it carries no action bytes.
+        snapshot_req = n == SNAPSHOT_SENTINEL
+        action = read_exact(n) if (n and not snapshot_req) else b""
         tick = {{"reward": 0.0, "done": False, "terminated": False, "truncated": False, "info": {{}}}}
         try:
-            if action:
+            if snapshot_req:
+                ok = save_state(force=True)
+                obs = current_obs()
+                tick["info"] = {{"snapshot": "true" if ok else "unsupported", "steps": str(_step_count)}}
+            elif action:
                 obs, reward, terminated, truncated, info = do_step(action)
                 _step_count += 1
                 _terminal = bool(terminated or truncated)
@@ -1905,6 +2442,7 @@ while True:
             marker = PROTOCOL_MARKER,
             state_file = STATE_FILE,
             proto = PROTOCOL_FD,
+            snapshot_sentinel = SNAPSHOT_SENTINEL,
         )
     })
 }

@@ -31,7 +31,7 @@ pub fn work_root() -> &'static PathBuf {
 }
 
 pub async fn dispatch<W: AsyncWrite + Unpin>(
-    state: &EngineState,
+    state: &std::sync::Arc<EngineState>,
     settings: Settings,
     writer: &FrameWriter<W>,
     data: Option<&DataChannel>,
