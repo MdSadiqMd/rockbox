@@ -46,6 +46,17 @@ pub enum Command {
         actions: Vec<Vec<u8>>,
     },
 
+    /// RL-mode snapshot: ask the live worker to checkpoint its env state to
+    /// the episode volume right now (fork / pause). Answered with an
+    /// [`crate::Response::RlStep`] whose `info["snapshot"]` reports the
+    /// outcome; the observation is the env's current one.
+    RlSnapshot { id: String, episode_id: String },
+
+    /// RL-mode close: kill the episode's worker and forget it, keeping the
+    /// engine alive for reuse by the next episode. Acked with an
+    /// [`crate::Response::RlStep`] carrying `info["closed"]`.
+    RlClose { id: String, episode_id: String },
+
     /// Forward additional stdin to the running child.
     Stdin {
         #[serde(with = "serde_bytes")]
