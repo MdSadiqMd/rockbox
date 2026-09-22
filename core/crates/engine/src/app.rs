@@ -178,7 +178,9 @@ impl Args {
 #[derive(Debug)]
 pub struct App {
     pub args: Args,
-    pub state: EngineState,
+    /// Shared so mode handlers can spawn background work (RL worker
+    /// prespawn) that outlives the command that triggered it.
+    pub state: std::sync::Arc<EngineState>,
 }
 
 impl App {
@@ -190,7 +192,7 @@ impl App {
             .json()
             .init();
         info!(schema = SCHEMA_VERSION, "engine_boot");
-        let state = EngineState::new();
+        let state = std::sync::Arc::new(EngineState::new());
         Ok(Self { args, state })
     }
 
@@ -267,6 +269,12 @@ impl App {
                     episode_id,
                     actions,
                 } => modes::rl::steps_batch(&state, id, episode_id, actions, &writer).await,
+                Command::RlSnapshot { id, episode_id } => {
+                    modes::rl::snapshot(&state, id, episode_id, &writer).await
+                }
+                Command::RlClose { id, episode_id } => {
+                    modes::rl::close(&state, id, episode_id, &writer, data.as_ref()).await
+                }
                 Command::Stdin { data: bytes } => state.send_stdin(&bytes).await,
                 Command::Interrupt { id } => state.interrupt(&id).await,
                 Command::Lsp(p) => modes::lsp::relay(&state, p, &writer).await,
