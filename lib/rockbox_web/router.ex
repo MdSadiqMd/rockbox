@@ -39,6 +39,7 @@ defmodule RockboxWeb.Router do
     post("/rl/episodes/:episode_id/step", RLController, :step)
     post("/rl/episodes/:episode_id/steps", RLController, :steps)
     post("/rl/episodes/:episode_id/pause", RLController, :pause)
+    post("/rl/episodes/:episode_id/fork", RLController, :fork)
     delete("/rl/episodes/:episode_id", RLController, :delete)
     get("/rl/episodes/:episode_id/files", FileController, :show)
     get("/rl/episodes/:episode_id/files/content", FileController, :content)

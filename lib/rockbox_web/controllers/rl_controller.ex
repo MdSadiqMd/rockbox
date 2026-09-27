@@ -48,7 +48,7 @@ defmodule RockboxWeb.RLController do
 
       case VM.Server.execute_and_wait(vm_id, eff, timeout) do
         {:ok, %{"status" => "success", "output" => output}} ->
-          EpisodeRegistry.register(eff.request_id, vm_id, eff.workspace_id, eff.tier || :pro)
+          EpisodeRegistry.register(eff.request_id, vm_id, eff.workspace_id, eff.tier || :pro, eff)
           pin_owner!(eff.request_id, eff.workspace_id)
 
           initial =
@@ -288,9 +288,10 @@ defmodule RockboxWeb.RLController do
   def pause(conn, %{"episode_id" => eid} = params) do
     case resolve_route(params, eid) do
       {:ok, vm_id, workspace_id, _tier} ->
-        EpisodeRegistry.forget(eid)
-        VM.Supervisor.stop_vm(vm_id, :rl_episode_paused)
-        GenServer.cast(Rockbox.Pool.Manager, {:vm_dead, vm_id, workspace_id})
+        # Checkpoint the live state first so pause is lossless for any env
+        # with save(), not only ones whose periodic snapshot happened to land.
+        _ = VM.Server.rl_snapshot_wait(vm_id, eid)
+        release_episode_vm(vm_id, eid, workspace_id)
 
         _ =
           AuditLog.record(%{request_id: eid, workspace_id: workspace_id, status: "rl_paused"})
@@ -307,12 +308,82 @@ defmodule RockboxWeb.RLController do
     end
   end
 
+  @doc """
+  Fork a live episode into `n` children that all start from the parent's
+  current state (Morph Infinibranch-style branching for tree search / GRPO
+  rollouts). The parent worker is asked to checkpoint now; each child gets a
+  copy of the checkpoint under a fresh episode id and boots through the same
+  resume path crash recovery uses, so its first tick carries
+  `info["resumed"]`. Children are independent episodes with their own VMs.
+  Requires an env that defines save()/restore() — otherwise 422.
+  """
+  def fork(conn, %{"episode_id" => eid} = params) do
+    n = params["n"] || 1
+    caller_wid = conn.assigns.caller_workspace
+
+    with true <- is_integer(n) and n >= 1 and n <= 64,
+         {:ok, vm_id, wid, tier} <- owned_route!(conn, params, eid),
+         {:ok, snap} <- VM.Server.rl_snapshot_wait(vm_id, eid),
+         "true" <- get_in(snap, ["info", "snapshot"]) || "unsupported" do
+      wid = wid || caller_wid
+
+      children =
+        1..n
+        |> Task.async_stream(
+          fn _ ->
+            # Durable id (survives reboots as a directory name), so CSPRNG
+            # like Pipeline.ensure_request_id — not the VM.Server seqnum.
+            child_id = "ep_" <> Base.url_encode64(:crypto.strong_rand_bytes(12), padding: false)
+
+            with :ok <- EpisodeStore.clone_episode(eid, child_id),
+                 {:ok, child_vm} <- resurrect_episode(child_id, wid, tier) do
+              %{episode_id: child_id, vm_id: child_vm}
+            else
+              err ->
+                EpisodeStore.remove_episode(child_id)
+                %{episode_id: child_id, error: inspect(err)}
+            end
+          end,
+          max_concurrency: n,
+          timeout: 60_000,
+          ordered: true
+        )
+        |> Enum.map(fn {:ok, child} -> child end)
+
+      _ = AuditLog.record(%{request_id: eid, workspace_id: wid, status: "rl_forked"})
+
+      json(conn, %{
+        parent: eid,
+        steps: get_in(snap, ["info", "steps"]),
+        children: children
+      })
+    else
+      false ->
+        conn |> put_status(400) |> json(%{error: "n must be an integer in 1..64"})
+
+      "unsupported" ->
+        conn
+        |> put_status(422)
+        |> json(%{error: "snapshot_unsupported", detail: "env must define save()/restore()"})
+
+      {:error, :forbidden} ->
+        conn |> put_status(403) |> json(%{error: "forbidden"})
+
+      {:error, :episode_not_found} ->
+        conn |> put_status(404) |> json(%{error: "episode_not_found"})
+
+      {:error, %{engine_died: info}} ->
+        conn |> put_status(500) |> json(%{error: "engine_died", info: info})
+
+      {:error, _} ->
+        conn |> put_status(504) |> json(%{error: "timeout"})
+    end
+  end
+
   def delete(conn, %{"episode_id" => eid} = params) do
     case resolve_route(params, eid) do
       {:ok, vm_id, workspace_id, _tier} ->
-        EpisodeRegistry.forget(eid)
-        VM.Supervisor.stop_vm(vm_id, :rl_episode_done)
-        GenServer.cast(Rockbox.Pool.Manager, {:vm_dead, vm_id, workspace_id})
+        release_episode_vm(vm_id, eid, workspace_id)
         EpisodeStore.remove_episode(eid)
 
         _ =
@@ -321,14 +392,41 @@ defmodule RockboxWeb.RLController do
         json(conn, %{ok: true, episode_id: eid})
 
       {:error, :episode_not_found} ->
-        # Durable episodes (paused / VM-lost) are owner-checked before removal.
-        if owns_durable_episode?(eid, conn.assigns.caller_workspace) do
-          EpisodeStore.remove_episode(eid)
-          json(conn, %{ok: true, episode_id: eid, already_gone: true})
-        else
-          conn |> put_status(404) |> json(%{error: "episode_not_found"})
+        # Durable episodes (paused / VM-lost) are owner-checked before
+        # removal; an id with no live route and no durable state is already
+        # gone, and delete stays idempotent for it.
+        case EpisodeStore.fetch_settings(eid) do
+          :error ->
+            json(conn, %{ok: true, episode_id: eid, already_gone: true})
+
+          {:ok, %{"workspace_id" => wid}} when wid == conn.assigns.caller_workspace ->
+            EpisodeStore.remove_episode(eid)
+            json(conn, %{ok: true, episode_id: eid, already_gone: true})
+
+          _ ->
+            conn |> put_status(404) |> json(%{error: "episode_not_found"})
         end
     end
+  end
+
+  # Episode teardown keeps the engine: kill only the worker and hand the VM
+  # back to its pool bucket, so the next episode skips engine boot + cold
+  # spawn. Falls back to stopping the VM when the route predates settings
+  # capture or the engine does not answer.
+  defp release_episode_vm(vm_id, eid, workspace_id) do
+    settings = EpisodeRegistry.lookup_settings(eid)
+    EpisodeRegistry.forget(eid)
+
+    with %Effective{} = eff <- settings,
+         {:ok, %{"info" => %{"closed" => _}}} <- VM.Server.rl_close_wait(vm_id, eid) do
+      Pool.release(vm_id, eff)
+    else
+      _ ->
+        VM.Supervisor.stop_vm(vm_id, :rl_episode_done)
+        GenServer.cast(Rockbox.Pool.Manager, {:vm_dead, vm_id, workspace_id})
+    end
+
+    :ok
   end
 
   defp resolve_route(params, eid) do
@@ -414,7 +512,7 @@ defmodule RockboxWeb.RLController do
                     case VM.Server.execute_and_wait(vm_id, eff, timeout) do
                       {:ok, %{"status" => "success"}} ->
                         Logger.info("resurrect success for #{eid} on #{vm_id}")
-                        EpisodeRegistry.register(eid, vm_id, workspace_id, tier || :pro)
+                        EpisodeRegistry.register(eid, vm_id, workspace_id, tier || :pro, eff)
                         {:ok, vm_id}
 
                       {:ok, %{"status" => status} = res} ->
