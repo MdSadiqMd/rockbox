@@ -230,6 +230,21 @@ export class Episode {
     return resp.ticks.map(decodeTick);
   }
 
+  /**
+   * Branch this episode into `n` children starting from its current state
+   * (env must define save()/restore()). Children are independent episodes;
+   * this one keeps running.
+   */
+  async fork(n = 1): Promise<Episode[]> {
+    const resp = await this.client._request<{
+      children: Array<{ episode_id: string; vm_id?: string; error?: string }>;
+    }>("POST", `/api/rl/episodes/${this.id}/fork`, { n });
+    return resp.children.map((c) => {
+      if (c.error) throw new Error(`fork failed: ${c.error}`);
+      return new Episode(this.client, { episode_id: c.episode_id, vm_id: c.vm_id ?? "", initial: {} });
+    });
+  }
+
   // ---------------------------------------------------------------- files
 
   listFiles(path = "/"): Promise<FileEntry[]> {

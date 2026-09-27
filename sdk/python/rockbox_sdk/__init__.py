@@ -91,6 +91,20 @@ class _Episode:
             t["observation_bytes"] = _mp_to_bytes(t.get("observation"))
         return resp
 
+    def fork(self, n: int = 1) -> list["_Episode"]:
+        """Branch this episode into `n` children that start from its current
+        state (env must define save()/restore()). Children are independent
+        episodes; this one keeps running. Their first tick carries
+        info["resumed"]."""
+        _, resp = self.client._request(
+            "POST", f"/api/rl/episodes/{self.id}/fork", {"n": n})
+        out = []
+        for child in resp["children"]:
+            if "error" in child:
+                raise RockboxError(500, child)
+            out.append(_Episode(self.client, child["episode_id"], {}))
+        return out
+
     def metrics(self) -> dict:
         return self.client._request("GET", "/api/usage")[1]
 
