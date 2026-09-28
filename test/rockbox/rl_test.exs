@@ -80,3 +80,72 @@ defmodule Rockbox.WireRLTest do
     end
   end
 end
+
+defmodule Rockbox.EpisodeForkTest do
+  use ExUnit.Case, async: false
+
+  alias Rockbox.{EpisodeStore, Wire}
+
+  setup do
+    root = Path.join(System.tmp_dir!(), "rockbox_fork_#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    prev = Application.get_env(:rockbox, :episodes_root)
+    Application.put_env(:rockbox, :episodes_root, root)
+
+    on_exit(fn ->
+      File.rm_rf!(root)
+
+      if prev,
+        do: Application.put_env(:rockbox, :episodes_root, prev),
+        else: Application.delete_env(:rockbox, :episodes_root)
+    end)
+
+    {:ok, root: root}
+  end
+
+  test "rl_snapshot wire command is internally tagged like the other rl commands" do
+    assert %{"cmd" => "rl_snapshot", "id" => "req_9", "episode_id" => "ep_9"} =
+             Wire.rl_snapshot("req_9", "ep_9")
+  end
+
+  test "clone_episode copies manifest with child id plus checkpoint", %{root: root} do
+    parent = Path.join(root, "ep_parent")
+    File.mkdir_p!(parent)
+
+    File.write!(
+      Path.join(parent, "manifest.json"),
+      Jason.encode!(%{"request_id" => "ep_parent", "workspace_id" => "ws_a", "mode" => "rl_step"})
+    )
+
+    File.write!(Path.join(parent, "state.pkl"), <<128, 4, 1, 2, 3>>)
+    File.write!(Path.join(parent, "user_file.txt"), "not copied")
+
+    assert :ok = EpisodeStore.clone_episode("ep_parent", "ep_child")
+
+    assert {:ok, %{"request_id" => "ep_child", "workspace_id" => "ws_a", "mode" => "rl_step"}} =
+             EpisodeStore.fetch_settings("ep_child")
+
+    assert File.read!(Path.join([root, "ep_child", "state.pkl"])) == <<128, 4, 1, 2, 3>>
+    refute File.exists?(Path.join([root, "ep_child", "user_file.txt"]))
+    # Parent untouched — forks never move state.
+    assert {:ok, %{"request_id" => "ep_parent"}} = EpisodeStore.fetch_settings("ep_parent")
+  end
+
+  test "clone_episode without a checkpoint still yields a resumable manifest", %{root: root} do
+    parent = Path.join(root, "ep_nostate")
+    File.mkdir_p!(parent)
+
+    File.write!(
+      Path.join(parent, "manifest.json"),
+      Jason.encode!(%{"request_id" => "ep_nostate"})
+    )
+
+    assert :ok = EpisodeStore.clone_episode("ep_nostate", "ep_child2")
+    refute File.exists?(Path.join([root, "ep_child2", "state.pkl"]))
+    assert {:ok, %{"request_id" => "ep_child2"}} = EpisodeStore.fetch_settings("ep_child2")
+  end
+
+  test "clone_episode of an unknown parent fails cleanly" do
+    assert {:error, :no_manifest} = EpisodeStore.clone_episode("ep_missing", "ep_x")
+  end
+end
