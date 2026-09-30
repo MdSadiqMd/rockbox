@@ -22,7 +22,7 @@ RL_RS = ROOT / "core" / "crates" / "engine" / "src" / "modes" / "rl.rs"
 
 def extract_shim() -> str:
     text = RL_RS.read_text()
-    start_marker = 'r#"import importlib.util'
+    start_marker = 'r#"import os, struct, sys, types'
     start = text.index(start_marker) + len('r#"')
     end_marker = '\n"#,\n'
     end = text.index(end_marker, start)
