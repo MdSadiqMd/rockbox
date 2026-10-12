@@ -1,5 +1,10 @@
 import Config
 
+# Multi-node placement (Rockbox.Cluster). Unset = single node.
+config :rockbox,
+  node_url: System.get_env("ROCKBOX_NODE_URL"),
+  cluster_nodes: System.get_env("ROCKBOX_CLUSTER_NODES")
+
 if System.get_env("PHX_SERVER") do
   config :rockbox, RockboxWeb.Endpoint, server: true
 end
