@@ -23,6 +23,22 @@ pub struct BpfProfile {
     pub program: Arc<BpfProgram>,
 }
 
+impl BpfProfile {
+    /// Raw `sock_filter[]` bytes (8 bytes each, host endianness) for loading
+    /// the same filter from another process via `seccomp(2)` — the exec
+    /// zygote's forks install it themselves.
+    pub fn raw_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.program.len() * 8);
+        for f in self.program.iter() {
+            out.extend_from_slice(&f.code.to_ne_bytes());
+            out.push(f.jt);
+            out.push(f.jf);
+            out.extend_from_slice(&f.k.to_ne_bytes());
+        }
+        out
+    }
+}
+
 /// Per-engine seccomp cache. Compiles every known profile once at
 /// construction (FIX PERF-07) — subsequent `compile()` calls are lock-free
 /// map lookups (~50ns), and `apply()` loads the pre-built BPF via the raw

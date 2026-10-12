@@ -15,7 +15,7 @@ use crate::error::{SandboxError, SandboxResult};
 use crate::spec::ChildSpec;
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tracing::debug;
@@ -133,6 +133,12 @@ impl SandboxLauncher {
         }
     }
 
+    /// A pooled, configured cgroup for a request that is not launched through
+    /// [`Self::launch`] (zygote forks are placed into it by pid).
+    pub fn acquire_cgroup(&self, spec: &ChildSpec) -> SandboxResult<cgroup::Cgroup> {
+        self.take_cgroup(spec)
+    }
+
     fn take_cgroup(&self, spec: &ChildSpec) -> SandboxResult<cgroup::Cgroup> {
         let cfg = cgroup::CgroupConfig {
             limits: spec.limits,
@@ -174,7 +180,9 @@ impl SandboxLauncher {
         let (stdin_r, stdin_w) = make_pipe()?;
         // Protocol pipe for persistent workers: parent's read end is handed
         // to ChildHandle::proto_fd, child's write/read end becomes fd 3.
-        let proto_pipe = if spec.protocol_fd {
+        let proto_pipe = if spec.zygote {
+            Some(make_seqpacket_pair()?)
+        } else if spec.protocol_fd {
             Some(make_pipe()?)
         } else {
             None
@@ -306,14 +314,21 @@ impl SandboxLauncher {
             );
             if let Err(e) = run {
                 // Raw errno print — no allocation in the child.
+                // Name the failing layer too: an errno alone could not
+                // distinguish "execve failed" from "seccomp failed".
                 let (errno, step) = match &e {
                     SandboxError::Mount { step, source } => {
                         (source.raw_os_error().unwrap_or(-1), *step)
                     }
-                    SandboxError::RLimit { source, .. } => {
-                        (source.raw_os_error().unwrap_or(-1), "")
+                    SandboxError::RLimit { source, limit } => {
+                        (source.raw_os_error().unwrap_or(-1), *limit)
                     }
-                    _ => (-1, ""),
+                    SandboxError::Seccomp(_) => (-1, "seccomp"),
+                    SandboxError::AppArmor(_) => (-1, "apparmor"),
+                    SandboxError::CapDrop(_) => (-1, "capdrop"),
+                    SandboxError::Io(source) => (source.raw_os_error().unwrap_or(-1), "exec"),
+                    SandboxError::Internal(_) => (-1, "internal"),
+                    _ => (-1, "other"),
                 };
                 let mut buf = [0u8; 96];
                 let prefix = b"child setup failed errno=";
@@ -588,8 +603,10 @@ fn run_child(
     mount_plan.apply()?;
     child_diag(diag_fd, tag, "C4 mounts done");
 
-    // 3. AppArmor (Layer 0/8) — staged for next exec.
-    if let Some(cmd) = apparmor_cmd {
+    // 3. AppArmor (Layer 0/8) — staged for next exec. A zygote stays in
+    // the launcher's profile and confines each fork itself (the sandbox
+    // profile denies mount/unshare, which the zygote needs per fork).
+    if let (Some(cmd), false) = (apparmor_cmd, spec.zygote) {
         apparmor::write_attr_exec(cmd)?;
     }
     child_diag(diag_fd, tag, "C5 apparmor done");
@@ -601,16 +618,17 @@ fn run_child(
     }
     child_diag(diag_fd, tag, "C6 nnp done");
 
-    // 5. Seccomp (Layer 3 in §6). Stateless apply — the BPF blob was compiled
-    // once at engine boot and is now just being reloaded into this task.
-    seccomp::SeccompResolver::apply(bpf)?;
-    child_diag(diag_fd, tag, "C7 seccomp done");
-
-    // 6. Drop caps + rlimits (Layers 5 & 6).
-    caps::drop_all_capabilities()?;
-    child_diag(diag_fd, tag, "C8 caps done");
-    caps::apply_rlimits(&spec.limits)?;
-    child_diag(diag_fd, tag, "C9 rlimits done");
+    // 5./6. Seccomp, caps, rlimits (Layers 3, 5, 6). A zygote applies all
+    // three in every fork instead (it needs CAP_SYS_ADMIN for the per-request
+    // namespaces and mounts until then).
+    if !spec.zygote {
+        seccomp::SeccompResolver::apply(bpf)?;
+        child_diag(diag_fd, tag, "C7 seccomp done");
+        caps::drop_all_capabilities()?;
+        child_diag(diag_fd, tag, "C8 caps done");
+        caps::apply_rlimits(&spec.limits)?;
+        child_diag(diag_fd, tag, "C9 rlimits done");
+    }
 
     // 7. execve via fexecve (verified fd) or pinned interpreter path.
     let exe = if let Some(p) = fd_path {
@@ -627,11 +645,9 @@ fn run_child(
     unsafe {
         libc::execve(exe.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr());
     }
-    // If we got here, execve failed.
-    Err(SandboxError::Internal(format!(
-        "execve: {}",
-        std::io::Error::last_os_error()
-    )))
+    // If we got here, execve failed. Raw errno, no format!/allocation in the
+    // fork child; the diag path prints it next to the "exec" layer name.
+    Err(SandboxError::Io(std::io::Error::last_os_error()))
 }
 
 /// Raw write to `fd` for the fork child. `eprintln!` is forbidden there: the
@@ -660,6 +676,30 @@ fn child_diag(fd: RawFd, tag: u32, msg: &str) {
         libc::write(fd, msg.as_ptr() as *const libc::c_void, msg.len());
         libc::write(fd, tail.as_ptr() as *const libc::c_void, tail.len());
     }
+}
+
+/// `SOCK_SEQPACKET` pair (parent end, child end) for the zygote's fd 3: message
+/// framing for free and `SCM_RIGHTS` so per-request stdio pipes can be
+/// handed to the forked child.
+fn make_seqpacket_pair() -> SandboxResult<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: socketpair writes two fds into the array on success.
+    let rc = unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            fds.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(SandboxError::Internal(format!(
+            "socketpair: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: both fds are fresh and owned by us.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 fn make_pipe() -> SandboxResult<(OwnedFd, OwnedFd)> {
