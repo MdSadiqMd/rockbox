@@ -42,6 +42,13 @@ pub struct ChildSpec {
     /// on their regular pipes. The parent keeps the read end on
     /// [`crate::ChildHandle::proto_fd`].
     pub protocol_fd: bool,
+    /// Zygote launch: a long-lived helper that forks per request and applies
+    /// seccomp / caps / rlimits / AppArmor itself in each fork. The launcher
+    /// therefore skips those layers for the zygote process (it keeps the
+    /// namespaces, mounts and NO_NEW_PRIVS) and wires fd 3 as a
+    /// `SOCK_SEQPACKET` socketpair so the engine can pass per-request pipes
+    /// with `SCM_RIGHTS`.
+    pub zygote: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +79,10 @@ pub struct ResourceLimits {
     pub fsize_bytes: u64,
     pub address_space_bytes: u64,
     pub stack_bytes: u64,
+    /// cgroup v2 `cpu.weight` (1..=10000, kernel default 100). Sibling
+    /// sandbox cgroups share CPU proportionally to weight under contention;
+    /// quota (`cpu_quota_us`) still caps each one.
+    pub cpu_weight: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
