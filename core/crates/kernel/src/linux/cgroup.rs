@@ -14,7 +14,31 @@ use crate::spec::ResourceLimits;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
-pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+/// Parent of every sandbox cgroup. Sandboxes used to sit directly under the
+/// v2 root, where each one was a sibling of the orchestrator's own cgroup
+/// (the container / service slice holding BEAM + engines) at equal weight:
+/// 24 busy sandboxes starved the request path 24:1. Under one parent the
+/// whole sandbox set is a single sibling, so the orchestrator keeps half the
+/// machine under saturation and per-mode `cpu.weight` applies among sandboxes.
+pub const CGROUP_ROOT: &str = "/sys/fs/cgroup/rockbox";
+
+/// Create the parent once per process and delegate the controllers the
+/// children need. Idempotent across engines sharing the host.
+fn ensure_root() -> SandboxResult<()> {
+    static ONCE: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let root = Path::new(CGROUP_ROOT);
+        if let Err(e) = std::fs::create_dir(root)
+            && e.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(format!("create {}: {e}", root.display()));
+        }
+        std::fs::write(root.join("cgroup.subtree_control"), "+cpu +memory +pids")
+            .map_err(|e| format!("subtree_control: {e}"))
+    })
+    .clone()
+    .map_err(|msg| io_cg("ensure_root", std::io::Error::other(msg)))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct CgroupConfig {
@@ -28,6 +52,9 @@ pub struct Cgroup {
     memory_max: OwnedFd,
     pids_max: OwnedFd,
     cpu_max: OwnedFd,
+    cpu_weight: OwnedFd,
+    /// `None` when the kernel has no swap accounting for this hierarchy.
+    memory_swap_max: Option<OwnedFd>,
     events: OwnedFd,
     memory_peak: OwnedFd,
     pids_peak: OwnedFd,
@@ -42,6 +69,7 @@ impl Cgroup {
     /// Create a fresh cgroup directory under [`CGROUP_ROOT`]. Returns an
     /// `O_PATH | O_DIRECTORY` fd suitable for `clone3 + CLONE_INTO_CGROUP`.
     pub fn create(name: &str, cfg: CgroupConfig) -> SandboxResult<Self> {
+        ensure_root()?;
         let path = Path::new(CGROUP_ROOT).join(name);
         if path.exists() {
             // Leftover from an earlier engine generation. Reuse is unsafe:
@@ -62,6 +90,8 @@ impl Cgroup {
             memory_max: open_file(&path, "memory.max", libc::O_WRONLY)?,
             pids_max: open_file(&path, "pids.max", libc::O_WRONLY)?,
             cpu_max: open_file(&path, "cpu.max", libc::O_WRONLY)?,
+            cpu_weight: open_file(&path, "cpu.weight", libc::O_WRONLY)?,
+            memory_swap_max: open_file(&path, "memory.swap.max", libc::O_WRONLY).ok(),
             events: open_file(&path, "cgroup.events", libc::O_RDONLY)?,
             memory_peak: open_file(&path, "memory.peak", libc::O_RDWR)?,
             pids_peak: open_file(&path, "pids.peak", libc::O_RDWR)?,
@@ -74,17 +104,31 @@ impl Cgroup {
     }
 
     /// (Re)apply resource limits. Called on fresh create and on pool reuse —
-    /// reuse therefore costs 3 tiny `pwrite`s instead of the full
+    /// reuse therefore costs 4 tiny `pwrite`s instead of the full
     /// mkdir + write + open chain.
     pub fn configure(&self, cfg: CgroupConfig) -> SandboxResult<()> {
         fd_write(
             &self.memory_max,
             cfg.limits.memory_bytes.to_string().as_bytes(),
         )?;
+        // No swap: with `memory.swap.max = max` a sandbox at its limit pages
+        // out instead of being OOM-killed, so `memory_mb` was never a hard
+        // cap on hosts with swap (a 400 MB allocation "succeeded" under 128).
+        if let Some(fd) = &self.memory_swap_max {
+            fd_write(fd, b"0")?;
+        }
         fd_write(&self.pids_max, cfg.limits.pids_max.to_string().as_bytes())?;
         fd_write(
             &self.cpu_max,
             format!("{} {}", cfg.limits.cpu_quota_us, cfg.limits.cpu_period_us).as_bytes(),
+        )?;
+        fd_write(
+            &self.cpu_weight,
+            cfg.limits
+                .cpu_weight
+                .clamp(1, 10_000)
+                .to_string()
+                .as_bytes(),
         )?;
         Ok(())
     }
@@ -134,6 +178,25 @@ impl Cgroup {
         self.killed.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Change only the CPU share (a warm RL worker boots at the batch weight
+    /// and is promoted to the interactive weight when an episode claims it).
+    pub fn set_cpu_weight(&self, weight: u32) -> SandboxResult<()> {
+        fd_write(
+            &self.cpu_weight,
+            weight.clamp(1, 10_000).to_string().as_bytes(),
+        )
+    }
+
+    /// Whether the kernel OOM-killed a task in this cgroup (`memory.events`).
+    pub fn oom_killed(&self) -> bool {
+        std::fs::read_to_string(self.path.join("memory.events"))
+            .map(|s| {
+                s.lines()
+                    .any(|l| l.starts_with("oom_kill ") && l.split_whitespace().nth(1) != Some("0"))
+            })
+            .unwrap_or(false)
+    }
+
     /// Reset peak counters so the cgroup can be re-used from the pool.
     pub fn reset_peaks(&self) -> SandboxResult<()> {
         // `memory.peak` and `pids.peak` accept "0" to reset on kernel >= 6.0.
@@ -148,12 +211,17 @@ impl Cgroup {
     }
 
     pub fn wait_empty(&self) -> SandboxResult<()> {
-        // Poll `cgroup.events` for `populated 0` (via the cached fd).
-        for _ in 0..200 {
+        // Poll `cgroup.events` for `populated 0` (via the cached fd). A
+        // SIGKILLed worker is gone within ~100µs; the old fixed 5 ms sleep
+        // made every episode close cost 6 ms. Back off 50µs → 5 ms, ~1 s cap.
+        let mut nap = std::time::Duration::from_micros(50);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
             if !self.is_populated()? {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(nap);
+            nap = (nap * 2).min(std::time::Duration::from_millis(5));
         }
         Err(SandboxError::Cgroup {
             op: "wait_empty",
