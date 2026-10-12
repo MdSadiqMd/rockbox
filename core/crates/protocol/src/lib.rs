@@ -19,7 +19,7 @@ pub use command::{Command, FileEntry, LspParams};
 pub use error::{ProtocolError, Result};
 pub use response::{EngineDeath, EpisodeMetrics, Response, ResultStatus, RlTick};
 pub use settings::{
-    Capability, CostSettings, Determinism, FilesystemSettings, GpuSettings, Language,
+    Capability, CostSettings, Determinism, FilesystemSettings, GpuSettings, Isolation, Language,
     LifecyclePolicy, LifecycleSettings, Limits, Mode, NetworkSettings, NetworkTier,
     ObservabilitySettings, OutputAction, OutputSettings, Settings, WebhookSettings,
 };

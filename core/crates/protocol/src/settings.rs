@@ -67,6 +67,19 @@ pub struct Settings {
 
     #[serde(default)]
     pub cost: CostSettings,
+
+    /// Isolation backend: the shared-kernel 10-layer sandbox (default) or a
+    /// Firecracker microVM per request (`microvm`, needs /dev/kvm + assets).
+    #[serde(default)]
+    pub isolation: Isolation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Isolation {
+    #[default]
+    Sandbox,
+    Microvm,
 }
 
 fn default_schema() -> String {

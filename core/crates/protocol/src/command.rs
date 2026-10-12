@@ -52,6 +52,11 @@ pub enum Command {
     /// outcome; the observation is the env's current one.
     RlSnapshot { id: String, episode_id: String },
 
+    /// RL-mode pre-warm: boot warm workers for this sandbox shape before any
+    /// episode asks, so a pool-prewarmed engine's first create claims warm
+    /// instead of paying the ~10 ms cold worker launch. Fire-and-forget.
+    RlPrespawn(Box<Settings>),
+
     /// RL-mode close: kill the episode's worker and forget it, keeping the
     /// engine alive for reuse by the next episode. Acked with an
     /// [`crate::Response::RlStep`] carrying `info["closed"]`.
