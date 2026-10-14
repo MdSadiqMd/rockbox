@@ -160,47 +160,10 @@ pub fn resolve(settings: &Settings, work_dir: &PathBuf, bin_path: &Path) -> Vec<
             }
             false
         }
-        _ => {
-            // Trivial shell-script fast path for Rust/C++ also needs /bin/sh
-            for bin in [
-                "/bin/sh",
-                "/bin/dash",
-                "/bin/bash",
-                "/bin/echo",
-                "/usr/bin/echo",
-                "/bin/cat",
-                "/usr/bin/cat",
-            ] {
-                if Path::new(bin).exists() {
-                    out.push(MountKind::BindRo {
-                        src: PathBuf::from(bin),
-                        target: PathBuf::from(bin),
-                    });
-                }
-            }
-            if let Ok(real) = std::fs::read_link("/bin/sh") {
-                let real_path = if real.is_absolute() {
-                    real
-                } else {
-                    Path::new("/bin").join(real)
-                };
-                if real_path.exists() && real_path != Path::new("/bin/sh") {
-                    out.push(MountKind::BindRo {
-                        src: real_path.clone(),
-                        target: real_path,
-                    });
-                }
-            }
-            for lib in ["/lib", "/lib64", "/usr/lib", "/usr/lib/aarch64-linux-gnu"] {
-                if Path::new(lib).is_dir() {
-                    out.push(MountKind::BindRo {
-                        src: PathBuf::from(lib),
-                        target: PathBuf::from(lib),
-                    });
-                }
-            }
-            true
-        }
+        // Everything else runs straight from /nix/store (the shell
+        // fast-path binds that used to live here served a code path that no
+        // longer exists; 11 mounts per run for nothing).
+        _ => true,
     };
     if needs_nix_store && facts.nix_store {
         out.push(MountKind::BindRo {

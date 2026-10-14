@@ -267,6 +267,18 @@ pub fn resolve(
     work_root: &Path,
     binary_cache: Option<&BinaryCache>,
 ) -> Result<Resolved> {
+    resolve_opts(settings, work_root, binary_cache, true)
+}
+
+/// `materialize = false` skips writing the program files into the work dir
+/// (the exec zygote ships them in its request frame). Such results are not
+/// cached: a later classic request with the same digest must still write.
+pub fn resolve_opts(
+    settings: &Settings,
+    work_root: &Path,
+    binary_cache: Option<&BinaryCache>,
+    materialize: bool,
+) -> Result<Resolved> {
     settings.validate().map_err(|e| anyhow!(e))?;
 
     let runtime_name = settings.runtime.as_deref().unwrap_or_else(|| {
@@ -310,7 +322,9 @@ pub fn resolve(
     }
     let work_dir = work_root.join(hex_digest(&input_digest));
     let t_mat = std::time::Instant::now();
-    materialize_work_dir(settings, &work_dir, &input_digest)?;
+    if materialize {
+        materialize_work_dir(settings, &work_dir, &input_digest)?;
+    }
     let mat_ms = t_mat.elapsed().as_micros() as u64;
 
     let t_env = std::time::Instant::now();
@@ -372,7 +386,7 @@ pub fn resolve(
                     format!("/sandbox/{}", settings.entrypoint),
                 ]
             } else {
-                let key = compile_key(&runtime, &input_digest);
+                let key = compile_key(&runtime, &input_digest, bin_path);
                 let t_lookup = std::time::Instant::now();
                 let lookup = binary_cache.and_then(|c| c.lookup(&key).ok());
                 let lookup_ms = t_lookup.elapsed().as_micros() as u64;
@@ -406,7 +420,7 @@ pub fn resolve(
             // Content-addressed BinaryCache: warm hits execve the verified
             // cached fd (the compiler never runs); misses compile once with
             // the toolchain and store the artifact for later requests.
-            let key = compile_key(&runtime, &input_digest);
+            let key = compile_key(&runtime, &input_digest, bin_path);
             let t_lookup = std::time::Instant::now();
             let lookup = binary_cache.and_then(|c| c.lookup(&key).ok());
             let lookup_ms = t_lookup.elapsed().as_micros() as u64;
@@ -502,9 +516,12 @@ pub fn resolve(
         binary_fd_path,
         wall_timeout: Duration::from_millis(settings.limits.wall_ms),
         protocol_fd: matches!(settings.mode, Mode::RlStep | Mode::RlEpisode),
+        zygote: false,
     };
     let resolved = Resolved { spec, work_dir };
-    resolved_cache().insert(cache_key, resolved.clone());
+    if materialize {
+        resolved_cache().insert(cache_key, resolved.clone());
+    }
     Ok(resolved)
 }
 
@@ -560,12 +577,20 @@ fn materialize_work_dir(settings: &Settings, work_dir: &Path, digest: &[u8; 32])
 /// Cache key for a compile. The frozen `flake.lock` pins the toolchain, so
 /// code + lock + arch uniquely identify the artifact. `digest` is the
 /// already-computed `files_digest` of the program.
-fn compile_key(runtime: &RuntimeEntry, digest: &[u8; 32]) -> BinaryKey {
+/// Cache key = program digest + toolchain identity. The flake lock alone is
+/// not enough: dev images have no lock file (the runtime name stands in),
+/// so a rebuilt image with a different nix glibc served stale binaries
+/// whose ELF interpreter path no longer existed (`execve` ENOENT, exit
+/// 102). The canonical compiler path carries the store hash of the whole
+/// toolchain closure, so any toolchain change invalidates the entry.
+fn compile_key(runtime: &RuntimeEntry, digest: &[u8; 32], bin_path: &Path) -> BinaryKey {
+    use std::os::unix::ffi::OsStrExt;
+    let toolchain = [runtime.flake_lock_bytes(), bin_path.as_os_str().as_bytes()].concat();
     BinaryKey::from_parts(
         digest,
         &runtime.executable,
         std::env::consts::ARCH,
-        runtime.flake_lock_bytes(),
+        &toolchain,
     )
 }
 
@@ -869,6 +894,7 @@ pub(crate) mod cache_key_tests {
                 webhook: None,
             },
             cost: CostSettings::default(),
+            isolation: protocol::Isolation::default(),
         }
     }
 
@@ -984,6 +1010,7 @@ pub(crate) mod cache_key_tests {
                 fsize_bytes: 50 << 20,
                 address_space_bytes: 1 << 32,
                 stack_bytes: 8 << 20,
+                cpu_weight: 100,
             },
             seccomp_profile: SeccompProfileId::InterpAot,
             layers: SandboxLayers::default(),
@@ -991,6 +1018,7 @@ pub(crate) mod cache_key_tests {
             binary_fd_path: None,
             wall_timeout: Duration::from_millis(5000),
             protocol_fd: false,
+            zygote: false,
         };
         let resolved = Resolved {
             spec,
