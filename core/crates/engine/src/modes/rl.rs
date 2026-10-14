@@ -67,6 +67,12 @@ const STATE_FILE: &str = "state.pkl";
 /// Action-frame header value the shim treats as "snapshot now" instead of a
 /// byte count. Real actions are capped far below this by the pipe protocol.
 const SNAPSHOT_SENTINEL: u32 = u32::MAX;
+/// Header for a batched exchange: `count u32 BE`, then `count` x (`len u32 BE`
+/// + action). The worker answers ONE frame holding `count u32 BE` then
+/// `count` x (`len u32 BE` + tick frame). One wakeup pair per batch instead
+/// of per step: the per-step ping-pong was the RL ceiling (113k steps/s with
+/// half the cores idle, 32 workers x 64-step batches).
+const BATCH_SENTINEL: u32 = u32::MAX - 1;
 const MANIFEST_FILE: &str = "manifest.json";
 const SHIM_FILENAME: &str = ".rockbox_rl_worker.py";
 
@@ -90,11 +96,12 @@ impl Drop for Worker {
         // A killed cgroup can never be recycled (CGRP_KILL lingers in the
         // kernel), so remove it instead of returning it to the pool.
         let _ = self.cg.kill_all();
+        // Reap first: waitid blocks until the SIGKILLed interpreter is gone,
+        // so the cgroup is (nearly) empty by the time we poll it. Without
+        // this the zombie lingers for as long as the engine lives.
+        reap_worker(self._pidfd.as_raw_fd());
         let _ = self.cg.wait_empty();
         let _ = self.cg.remove();
-        // Reap via pidfd, otherwise the interpreter lingers as a zombie for
-        // as long as the (possibly warm) engine process lives.
-        reap_worker(self._pidfd.as_raw_fd());
     }
 }
 
@@ -145,6 +152,12 @@ impl std::fmt::Debug for WarmWorker {
 
 static WARM_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Warm-worker slots per engine. Depth 1 left an 18 ms p95 on serial
+/// create→destroy→create (the claim waited on the replacement's boot);
+/// depth 2 keeps one ready while the other boots. Cost: one idle
+/// interpreter (~10 MB) per RL engine.
+pub const WARM_DEPTH: usize = 2;
+
 fn prespawn_enabled() -> bool {
     std::env::var("ROCKBOX_RL_PRESPAWN")
         .map(|v| v != "0")
@@ -170,18 +183,23 @@ fn shape_fingerprint(s: &Settings) -> [u8; 32] {
     *blake3::hash(&bytes).as_bytes()
 }
 
-/// Boot the next warm worker in the background using `template` for the
-/// sandbox shape. Holds the slot's async lock for the whole boot so a claim
-/// arriving mid-boot waits for it instead of paying a cold start.
+/// Boot warm workers in the background using `template` for the sandbox
+/// shape, one per empty slot until every slot is ready or booting. A slot's
+/// async lock is held for the whole boot so a claim arriving mid-boot waits
+/// for it instead of paying a cold start.
 fn schedule_prespawn(state: Arc<EngineState>, template: Settings, data: Option<DataChannel>) {
     if !prespawn_enabled() || state.launcher.is_none() {
         return;
     }
     tokio::spawn(async move {
-        let mut slot = state.warm_worker.lock().await;
-        if slot.is_some() {
+        // Empty + unlocked slot, else nothing to do (all ready or booting).
+        let Some(mut slot) = state
+            .warm_workers
+            .iter()
+            .find_map(|m| m.try_lock().ok().filter(|g| g.is_none()))
+        else {
             return;
-        }
+        };
         sweep_stale_warm_dirs();
         let name = format!(
             ".warm-{}-{}",
@@ -196,7 +214,26 @@ fn schedule_prespawn(state: Arc<EngineState>, template: Settings, data: Option<D
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
         let fingerprint = shape_fingerprint(&template);
         let t0 = Instant::now();
-        match launch_worker(&state, &template, &name, data.as_ref(), true).await {
+        let wall_ms = template.limits.wall_ms.max(1_000);
+        let booted = match launch_worker(&state, &template, &name, data.as_ref(), true).await {
+            // Hold the slot until the shim's hello frame: "ready" means
+            // listening for the load frame, not merely forked. Measured:
+            // claims on a just-launched slot waited ~10 ms for the
+            // interpreter; on a hello'd slot they pay only load + reset.
+            Ok(worker) => tokio::task::spawn_blocking(move || {
+                let deadline = Instant::now() + Duration::from_millis(wall_ms);
+                match read_frame_poll(worker.proto_r.as_raw_fd(), deadline) {
+                    Ok(hello) if hello.is_empty() => Ok(worker),
+                    Ok(_) => Err(anyhow!("warm worker sent a non-empty hello")),
+                    Err(PipeFail::TimedOut) => Err(anyhow!("warm worker boot timed out")),
+                    Err(PipeFail::Closed) => Err(anyhow!("warm worker exited during boot")),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow!("warm worker boot join: {e:#}"))),
+            Err(e) => Err(e),
+        };
+        match booted {
             Ok(worker) => {
                 debug!(boot_ms = %t0.elapsed().as_millis(), "rl_prespawn_ready");
                 *slot = Some(WarmWorker {
@@ -208,9 +245,19 @@ fn schedule_prespawn(state: Arc<EngineState>, template: Settings, data: Option<D
             Err(e) => {
                 warn!(error = %e, "rl_prespawn_failed");
                 let _ = std::fs::remove_dir_all(&dir);
+                return;
             }
         }
+        drop(slot);
+        // Fill the next empty slot, if any.
+        schedule_prespawn(state.clone(), template, data);
     });
+}
+
+/// `Command::RlPrespawn`: start filling the warm slots for `template`'s
+/// sandbox shape without an episode. Used by pool pre-warm on fresh engines.
+pub fn prespawn(state: &Arc<EngineState>, template: Settings, data: Option<&DataChannel>) {
+    schedule_prespawn(state.clone(), template, data.cloned());
 }
 
 /// Make the warm worker's volume the episode directory. The worker's
@@ -271,18 +318,30 @@ async fn claim_warm(
         return None;
     }
     let t0 = Instant::now();
-    let warm = {
-        let mut slot = state.warm_worker.lock().await;
-        match slot.take() {
-            Some(w) if w.fingerprint == shape_fingerprint(settings) => w,
-            Some(w) => {
-                debug!("rl_prespawn_shape_mismatch");
-                let _ = std::fs::remove_dir_all(&w.dir);
-                drop(w);
-                return None;
+    let fingerprint = shape_fingerprint(settings);
+    // Ready slots first (no wait); then lock each slot in turn — a slot that
+    // is still booting blocks until its worker is up, which beats a cold start.
+    let mut warm = state
+        .warm_workers
+        .iter()
+        .find_map(|m| m.try_lock().ok().and_then(|mut g| g.take()));
+    if warm.is_none() {
+        for m in &state.warm_workers {
+            if let Some(w) = m.lock().await.take() {
+                warm = Some(w);
+                break;
             }
-            None => return None,
         }
+    }
+    let warm = match warm {
+        Some(w) if w.fingerprint == fingerprint => w,
+        Some(w) => {
+            debug!("rl_prespawn_shape_mismatch");
+            let _ = std::fs::remove_dir_all(&w.dir);
+            drop(w);
+            return None;
+        }
+        None => return None,
     };
     let WarmWorker {
         mut worker, dir, ..
@@ -292,8 +351,11 @@ async fn claim_warm(
         let _ = std::fs::remove_dir_all(&dir);
         return None;
     }
-    // Keep the next one booting while this episode runs, so churn-heavy
-    // rollouts never wait on interpreter start.
+    let _ = worker
+        .cg
+        .set_cpu_weight(crate::resolver::limits::CPU_WEIGHT_INTERACTIVE);
+    // Start the replacement now (overlapping this episode's lifetime); it
+    // boots at the batch weight, so it cannot starve this handshake.
     schedule_prespawn(state.clone(), settings.clone(), data.cloned());
 
     let mut env = serde_json::Map::new();
@@ -931,7 +993,8 @@ pub async fn steps_batch<W: AsyncWrite + Unpin>(
         let mut alive = true;
         let mut failed_at: Option<usize> = None;
         let mut fail_reason: Option<String> = None;
-        for (i, action) in actions_for_block.into_iter().enumerate() {
+        let outcomes = worker_exchange_batch(&mut worker, &actions_for_block, wall_for_block);
+        for (i, outcome) in outcomes.into_iter().enumerate() {
             let req_id = format!("{id_for_block}-{i}");
             if !alive {
                 let mut t = protocol::RlTick::empty(req_id);
@@ -939,7 +1002,7 @@ pub async fn steps_batch<W: AsyncWrite + Unpin>(
                 ticks.push(t);
                 continue;
             }
-            match worker_exchange(&mut worker, &action, wall_for_block) {
+            match outcome {
                 StepOutcome::Tick(mut tick) => {
                     let (mut info, obs_meta) = match tick.info.take() {
                         Some(info) => Tick::split_obs_meta(info),
@@ -1233,6 +1296,17 @@ async fn launch_worker(
                 .context("resolve spec")?;
             // Keep the historical per-step filter choice for workers.
             resolved.spec.seccomp_profile = kernel::spec::SeccompProfileId::InterpAot;
+            // `ws.mode` is Exec for the resolver's benefit; a live worker is a
+            // long-lived stepping process and gets the interactive share. A
+            // warm (prespawned) worker boots at the batch weight so its
+            // interpreter start never outcompetes claims in flight; claim_warm
+            // promotes it. Serial create→destroy→create still overlaps the
+            // boot with the episode, so the next claim finds it ready.
+            resolved.spec.limits.cpu_weight = if prespawn {
+                crate::resolver::limits::CPU_WEIGHT_BATCH
+            } else {
+                crate::resolver::limits::CPU_WEIGHT_INTERACTIVE
+            };
             // Force the private protocol pipe regardless of settings.mode.
             resolved.spec.protocol_fd = true;
             let handle = launcher.launch(&resolved.spec).context("launch")?;
@@ -1342,6 +1416,73 @@ fn spawn_discarder(fd: OwnedFd) {
 /// blocking thread; enforces `wall_ms` via poll timeouts on both directions.
 fn worker_exchange(worker: &mut Worker, action: &[u8], wall_ms: u64) -> StepOutcome {
     worker_exchange_hdr(worker, action.len() as u32, action, wall_ms)
+}
+
+/// Send every action in one frame and read every tick back in one frame.
+/// Always returns exactly `actions.len()` outcomes; a short or malformed
+/// reply pads the tail with `Dead` so callers unwind like a mid-batch crash.
+fn worker_exchange_batch(
+    worker: &mut Worker,
+    actions: &[Vec<u8>],
+    wall_ms: u64,
+) -> Vec<StepOutcome> {
+    let n = actions.len();
+    // ponytail: one `wall_ms` deadline covers the whole batch, not each step.
+    let deadline = Instant::now() + Duration::from_millis(wall_ms.max(1));
+    let pipe_fail = |fail: &PipeFail, closed_msg: &str| match fail {
+        PipeFail::TimedOut => StepOutcome::Timeout,
+        PipeFail::Closed => StepOutcome::Dead(closed_msg.to_string()),
+    };
+    let mut buf = Vec::with_capacity(8 + actions.iter().map(|a| 4 + a.len()).sum::<usize>());
+    buf.extend_from_slice(&BATCH_SENTINEL.to_be_bytes());
+    buf.extend_from_slice(&(n as u32).to_be_bytes());
+    for a in actions {
+        buf.extend_from_slice(&(a.len() as u32).to_be_bytes());
+        buf.extend_from_slice(a);
+    }
+    if let Err(fail) = write_all_poll(worker.stdin_w.as_raw_fd(), &buf, deadline) {
+        return (0..n)
+            .map(|_| pipe_fail(&fail, "worker stdin closed"))
+            .collect();
+    }
+    let frame = match read_frame_poll(worker.proto_r.as_raw_fd(), deadline) {
+        Ok(f) => f,
+        Err(fail) => {
+            return (0..n)
+                .map(|_| pipe_fail(&fail, "worker exited mid-batch"))
+                .collect();
+        }
+    };
+    let mut out: Vec<StepOutcome> = Vec::with_capacity(n);
+    let u32be = |off: usize| -> Option<usize> {
+        frame
+            .get(off..off + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    let mut off = 4;
+    let count = u32be(0).unwrap_or(0).min(n);
+    for _ in 0..count {
+        let Some(len) = u32be(off) else { break };
+        off += 4;
+        let Some(tick_frame) = frame.get(off..off + len) else {
+            break;
+        };
+        off += len;
+        match parse_tick_frame(tick_frame) {
+            Ok((mut tick, obs_start)) => {
+                tick.obs = Some(tick_frame[obs_start..].to_vec());
+                out.push(StepOutcome::Tick(Box::new(tick)));
+            }
+            Err(e) => {
+                out.push(StepOutcome::Dead(format!("bad worker frame: {e}")));
+                break;
+            }
+        }
+    }
+    while out.len() < n {
+        out.push(StepOutcome::Dead("worker returned short batch".into()));
+    }
+    out
 }
 
 /// Control request: header carries `SNAPSHOT_SENTINEL` and no action bytes;
@@ -1733,6 +1874,7 @@ mod tests {
         let s = python_shim();
         assert!(s.contains("PRESPAWN = os.environ.get(\"ROCKBOX_PRESPAWN\") == \"1\""));
         assert!(s.contains("_load = _json_load.loads(read_exact(_n))"));
+        assert!(s.contains("respond(b\"\")\n    _n = int.from_bytes(read_exact(4), \"big\")"));
         assert!(s.contains("entry_path = os.path.join(ENV_DIR, _load[\"entry\"])"));
         // Cold boots keep the original /sandbox entry path.
         assert!(s.contains(
@@ -1796,6 +1938,15 @@ mod tests {
         assert!(s.contains("snapshot_req = n == SNAPSHOT_SENTINEL"));
         assert!(s.contains("save_state(force=True)"));
         assert!(s.contains("\"snapshot\": \"true\" if ok else \"unsupported\""));
+    }
+
+    #[test]
+    fn python_shim_handles_batch_sentinel() {
+        let s = python_shim();
+        assert!(s.contains(&format!("BATCH_SENTINEL = {}", u32::MAX - 1)));
+        assert!(s.contains("if n == BATCH_SENTINEL:"));
+        assert!(s.contains("def _step_frame(action):"));
+        assert!(s.contains("respond(count.to_bytes(4, \"big\") + b\"\".join(frames))"));
     }
 
     #[test]
@@ -2057,6 +2208,10 @@ if PRESPAWN:
     # frame on the action pipe. Files land on the private tmpfs; the json and
     # base64 imports happen here, off the episode's critical path.
     import json as _json_load, base64 as _b64_load
+    # Empty frame = "interpreter up, waiting for the load frame". The engine
+    # only publishes this worker as warm once it has seen it, so a claim
+    # never waits on interpreter start.
+    respond(b"")
     _n = int.from_bytes(read_exact(4), "big")
     _load = _json_load.loads(read_exact(_n))
     ENV_DIR = "/tmp/.rockbox_env"
@@ -2207,6 +2362,7 @@ if VECTORIZED and hasattr(mod, "VectorEnv"):
 
 RESUME = os.environ.get("ROCKBOX_EPISODE_RESUME") == "1"
 SNAPSHOT_SENTINEL = {snapshot_sentinel}
+BATCH_SENTINEL = {batch_sentinel}
 SNAPSHOT_EVERY = int(os.environ.get("ROCKBOX_EPISODE_SNAPSHOT_EVERY", "50"))
 PERSIST_EVERY_STEP = os.environ.get("ROCKBOX_EPISODE_PERSIST_STATE") == "1"
 _step_count = 0
@@ -2350,6 +2506,20 @@ def current_obs():
     target = vec_env if HAS_VEC else mod
     return as_bytes(target.observe()) if hasattr(target, "observe") else b""
 
+def _step_frame(action):
+    # One action -> one packed tick frame (batch path). Mirrors the single
+    # step branch of the protocol loop, including the checkpoint policy.
+    global _step_count, _terminal
+    try:
+        obs, reward, terminated, truncated, info = do_step(action)
+        _step_count += 1
+        _terminal = bool(terminated or truncated)
+    except BaseException:
+        import traceback
+        return _pack_tick(0.0, True, True, False, {{}}, error=traceback.format_exc())
+    save_state()
+    return _pack_tick(reward, _terminal, terminated, truncated, info) + obs
+
 seed = os.environ.get("ROCKBOX_EPISODE_SEED")
 seed = int(seed) if seed is not None else None
 _terminal = False
@@ -2369,6 +2539,21 @@ while True:
         break
     try:
         n = int.from_bytes(header, "big")
+        if n == BATCH_SENTINEL:
+            # Engine `worker_exchange_batch`: count, then length-prefixed
+            # actions; answer one frame of count + length-prefixed ticks.
+            count = int.from_bytes(read_exact(4), "big")
+            frames = []
+            for _ in range(count):
+                body = _step_frame(read_exact(int.from_bytes(read_exact(4), "big")))
+                frames.append(len(body).to_bytes(4, "big") + body)
+            respond(count.to_bytes(4, "big") + b"".join(frames))
+            try:
+                sys.stdout.flush()
+                sys.stderr.flush()
+            except Exception:
+                pass
+            continue
         # Header 0xFFFFFFFF is the engine's control request "snapshot now"
         # (fork / pause); it carries no action bytes.
         snapshot_req = n == SNAPSHOT_SENTINEL
@@ -2443,6 +2628,7 @@ while True:
             state_file = STATE_FILE,
             proto = PROTOCOL_FD,
             snapshot_sentinel = SNAPSHOT_SENTINEL,
+            batch_sentinel = BATCH_SENTINEL,
         )
     })
 }
