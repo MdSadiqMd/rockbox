@@ -272,6 +272,10 @@ impl App {
                 Command::RlSnapshot { id, episode_id } => {
                     modes::rl::snapshot(&state, id, episode_id, &writer).await
                 }
+                Command::RlPrespawn(settings) => {
+                    modes::rl::prespawn(&state, *settings, data.as_ref());
+                    Ok(())
+                }
                 Command::RlClose { id, episode_id } => {
                     modes::rl::close(&state, id, episode_id, &writer, data.as_ref()).await
                 }

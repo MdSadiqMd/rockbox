@@ -42,7 +42,11 @@ pub struct EngineState {
     /// RL worker booted ahead of the next episode (interpreter + shim up,
     /// user module not loaded). An async mutex so a claim waits for an
     /// in-flight prespawn instead of falling back to a cold boot.
-    pub warm_worker: tokio::sync::Mutex<Option<crate::modes::rl::WarmWorker>>,
+    /// Pre-booted RL workers, one per slot. Two slots so a claim that lands
+    /// while the previous claim's replacement is still booting (serial
+    /// create→destroy→create churn) still finds a ready worker.
+    pub warm_workers:
+        [tokio::sync::Mutex<Option<crate::modes::rl::WarmWorker>>; crate::modes::rl::WARM_DEPTH],
 }
 
 impl std::fmt::Debug for EngineState {
@@ -94,7 +98,7 @@ impl EngineState {
             sessions: Mutex::new(std::collections::HashMap::new()),
             episodes: Mutex::new(std::collections::HashMap::new()),
             lsp_servers: Mutex::new(std::collections::HashMap::new()),
-            warm_worker: tokio::sync::Mutex::new(None),
+            warm_workers: std::array::from_fn(|_| tokio::sync::Mutex::new(None)),
         }
     }
 
