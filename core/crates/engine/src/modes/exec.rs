@@ -13,13 +13,13 @@ use tracing::debug;
 
 /// Accumulate a stream's bytes with a caller-supplied cap; the single lossy
 /// UTF-8 conversion happens once, after the last chunk, instead of per chunk.
-struct ByteCap {
+pub(crate) struct ByteCap {
     buf: Vec<u8>,
     cap: usize,
 }
 
 impl ByteCap {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         // Cap the preallocation: pathological programs that emit garbage
         // still never allocate more than they could legally send.
         Self {
@@ -28,7 +28,7 @@ impl ByteCap {
         }
     }
 
-    fn extend(&mut self, bytes: &[u8]) {
+    pub(crate) fn extend(&mut self, bytes: &[u8]) {
         if self.buf.len() >= self.cap {
             return;
         }
@@ -41,7 +41,7 @@ impl ByteCap {
         self.buf.extend_from_slice(slice);
     }
 
-    fn into_lossy_string(self) -> String {
+    pub(crate) fn into_lossy_string(self) -> String {
         String::from_utf8_lossy(&self.buf).into_owned()
     }
 }
@@ -91,8 +91,25 @@ pub async fn run<W: AsyncWrite + Unpin>(
             let resolve_ms = t.elapsed().as_millis() as u64;
             tracing::debug!(?resolved.spec, "spec_for_launch");
             let t = Instant::now();
-            let handle = launcher.launch(&resolved.spec).context("launch")?;
+            let mut handle = launcher.launch(&resolved.spec).context("launch")?;
             let launch_ms = t.elapsed().as_millis() as u64;
+            // Feed the request's stdin, then close it so the program sees EOF.
+            // (Previously the payload was accepted but never written.)
+            let stdin_w = std::mem::replace(&mut handle.stdin_w, dummy_fd()?);
+            match settings.stdin.clone() {
+                Some(payload) => {
+                    let bytes = match payload {
+                        protocol::settings::StdinPayload::Text(t) => t.into_bytes(),
+                        protocol::settings::StdinPayload::Bytes(b) => b,
+                    };
+                    std::thread::spawn(move || {
+                        use std::io::Write as _;
+                        let mut f = std::fs::File::from(stdin_w);
+                        let _ = f.write_all(&bytes);
+                    });
+                }
+                None => drop(stdin_w),
+            }
             let (cg, mut drainer) = launcher
                 .make_drainer(handle, output_bytes_cap)
                 .context("make_drainer")?;
@@ -171,7 +188,12 @@ pub async fn run<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-fn map_status(exit: &kernel::ChildExit) -> (ResultStatus, i32) {
+/// Placeholder fd so `ChildHandle.stdin_w` can be moved out and closed early.
+fn dummy_fd() -> Result<std::os::fd::OwnedFd> {
+    Ok(std::fs::File::open("/dev/null")?.into())
+}
+
+pub(crate) fn map_status(exit: &kernel::ChildExit) -> (ResultStatus, i32) {
     use kernel::ChildExit;
     match *exit {
         ChildExit::Normal { status: 0, .. } => (ResultStatus::Success, 0),

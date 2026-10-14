@@ -17,8 +17,10 @@ use tokio::io::AsyncWrite;
 pub mod exec;
 pub mod lsp;
 pub mod memfd;
+pub mod microvm;
 pub mod rl;
 pub mod session;
+pub mod zygote;
 /// `/tmp/rockbox-work` is process-global; mkdir it once, not per request.
 /// Every mode joins its request work dirs under this root.
 pub fn work_root() -> &'static PathBuf {
@@ -41,6 +43,12 @@ pub async fn dispatch<W: AsyncWrite + Unpin>(
     // command re-carrying it.
     state.set_language(settings.language);
     match settings.mode {
+        Mode::Exec if settings.isolation == protocol::Isolation::Microvm => {
+            microvm::run(state, settings, writer, data).await
+        }
+        Mode::Exec if zygote::eligible(&settings) => {
+            zygote::run(state, settings, writer, data).await
+        }
         Mode::Exec => exec::run(state, settings, writer, data).await,
         Mode::Session => session::start_or_attach(state, settings, writer, data).await,
         Mode::RlStep | Mode::RlEpisode => rl::start(state, settings, writer, data).await,
