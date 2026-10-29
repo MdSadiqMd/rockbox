@@ -34,7 +34,7 @@ defmodule Rockbox.Settings.Effective do
     :clamped
   ]
 
-  defstruct @enforce_keys ++ [strict: false, cache_key: nil]
+  defstruct @enforce_keys ++ [strict: false, cache_key: nil, isolation: "sandbox"]
 
   @typedoc """
   A frozen Settings struct — never mutated after `Pipeline.run/2` returns.
@@ -75,44 +75,35 @@ defmodule Rockbox.Settings.Effective do
   enum atoms are stringified, file `content` is sent as raw bytes.
   """
   def to_wire(%__MODULE__{} = s) do
-    # SOTA Loop20: one hash per build. Old path hashed twice on miss
-    # (`WireCache.get` + `WireCache.put` each hashed). Now the key is
-    # computed once and threaded through both.
-    key = Rockbox.ExecCache.key(s)
-
-    case Rockbox.WireCache.get_with_key(s, key) do
-      {:ok, wire} ->
-        wire
-
-      :miss ->
-        wire = %{
-          "schema" => Rockbox.Wire.schema_version(),
-          "request_id" => s.request_id,
-          "labels" => s.labels,
-          "language" => Atom.to_string(s.language),
-          "runtime" => s.runtime,
-          "files" => Enum.map(s.files, &file_to_wire/1),
-          "entrypoint" => s.entrypoint,
-          "mode" => Atom.to_string(s.mode),
-          "session_id" => s.session_id,
-          "limits" => s.limits,
-          "lifecycle" => s.lifecycle,
-          "capabilities" => Enum.map(s.capabilities, &wire_cap/1),
-          "network" => s.network,
-          "filesystem" => s.filesystem,
-          "env" => s.env,
-          "resolved_secrets" => s.resolved_secrets,
-          "stdin" => s.stdin,
-          "determinism" => s.determinism,
-          "gpu" => s.gpu,
-          "output" => s.output,
-          "observability" => s.observability,
-          "cost" => s.cost
-        }
-
-        Rockbox.WireCache.put_with_key(s, wire, key)
-        wire
-    end
+    # Built fresh per call (~10µs). The old persistent_term WireCache
+    # replaced a shared term on every distinct program, and each replace
+    # forces a literal-area GC sweep across all processes — measured at
+    # ~73% of BEAM reductions under unique-program load.
+    %{
+      "schema" => Rockbox.Wire.schema_version(),
+      "request_id" => s.request_id,
+      "labels" => s.labels,
+      "language" => Atom.to_string(s.language),
+      "runtime" => s.runtime,
+      "files" => Enum.map(s.files, &file_to_wire/1),
+      "entrypoint" => s.entrypoint,
+      "mode" => Atom.to_string(s.mode),
+      "session_id" => s.session_id,
+      "limits" => s.limits,
+      "lifecycle" => s.lifecycle,
+      "capabilities" => Enum.map(s.capabilities, &wire_cap/1),
+      "network" => s.network,
+      "filesystem" => s.filesystem,
+      "env" => s.env,
+      "resolved_secrets" => s.resolved_secrets,
+      "stdin" => s.stdin,
+      "determinism" => s.determinism,
+      "gpu" => s.gpu,
+      "output" => s.output,
+      "observability" => s.observability,
+      "cost" => s.cost,
+      "isolation" => s.isolation
+    }
   end
 
   defp file_to_wire(%{} = f) do
