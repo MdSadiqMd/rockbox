@@ -8,6 +8,10 @@ defmodule Rockbox.Pool.Autoscaler do
   - Scale-down cooldown 5m
   - Max scale-down per cycle 25% of pool
   - Hysteresis: scale-up at util > 80%, scale-down at util < 20%
+  - Pre-warm: keep `idle >= recent_peak_busy - busy` per bucket (peak over a
+    10-minute window, at most 4 spawns per tick, 64 idle cap) so a burst
+    the size of the last one never pays engine boots; scale-down never
+    retires below that floor.
 
   Runs on a 2-second tick. Reads pool state from
   [`Rockbox.Pool.Manager.snapshot/0`]
@@ -23,10 +27,13 @@ defmodule Rockbox.Pool.Autoscaler do
   @util_high 0.80
   @util_low 0.20
   @tick_ms 2_000
+  @peak_window_ms 600_000
+  @prewarm_per_tick 4
+  @prewarm_cap 64
 
   defmodule State do
     @moduledoc false
-    defstruct ewma: %{}, last_up: %{}, last_down: %{}
+    defstruct ewma: %{}, last_up: %{}, last_down: %{}, peak: %{}
   end
 
   def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
@@ -57,18 +64,40 @@ defmodule Rockbox.Pool.Autoscaler do
       ewma_up = @alpha_up * util + (1 - @alpha_up) * prev_up
       ewma_down = @alpha_down * util + (1 - @alpha_down) * prev_down
 
+      {peak, acc} = track_peak(acc, key, busy)
+      want_idle = min(@prewarm_cap, max(0, peak - busy))
+      idle = total - busy
+
+      if idle < want_idle do
+        Rockbox.Pool.Manager.prewarm(key, min(@prewarm_per_tick, want_idle - idle))
+      end
+
       acc
       |> put_in([Access.key!(:ewma), {key, :up}], ewma_up)
       |> put_in([Access.key!(:ewma), {key, :down}], ewma_down)
-      |> maybe_scale(key, ewma_up, ewma_down, total)
+      |> maybe_scale(key, ewma_up, ewma_down, total, idle - want_idle)
     end)
+  end
+
+  # Highest concurrent busy count seen within the window; resets to the
+  # current level once the window since it was last reached expires.
+  defp track_peak(state, key, busy) do
+    now = System.system_time(:millisecond)
+
+    peak =
+      case Map.get(state.peak, key) do
+        {p, seen_at} when busy < p and now - seen_at <= @peak_window_ms -> {p, seen_at}
+        _ -> {busy, now}
+      end
+
+    {elem(peak, 0), put_in(state, [Access.key!(:peak), key], peak)}
   end
 
   defp group_by_key(snapshot) do
     Enum.group_by(snapshot, fn {_vm_id, %{key: k}} -> k end)
   end
 
-  defp maybe_scale(state, key, ewma_up, ewma_down, total) do
+  defp maybe_scale(state, key, ewma_up, ewma_down, total, surplus_idle) do
     now = System.system_time(:millisecond)
 
     cond do
@@ -80,9 +109,9 @@ defmodule Rockbox.Pool.Autoscaler do
         # Defer actual spawn to demand-driven path; here we just record cooldown.
         put_in(state, [Access.key!(:last_up), key], now)
 
-      ewma_down < @util_low and total > 1 and
+      ewma_down < @util_low and total > 1 and surplus_idle > 0 and
           not in_cooldown?(state.last_down[key], now, @scale_down_cooldown_ms) ->
-        retire = max(1, div(total, 4))
+        retire = min(max(1, div(total, 4)), surplus_idle)
         Logger.info("autoscaler scale_down key=#{inspect(key)} retire=#{retire}")
         Rockbox.Pool.Manager.retire(key, retire)
         put_in(state, [Access.key!(:last_down), key], now)

@@ -1,5 +1,5 @@
 defmodule Rockbox.Pool.Manager do
-  @moduledoc """
+  """
   Per-(workspace, language) hot/cold pool
 
   State is held inside the GenServer; pool inventories are kept in a small
@@ -68,6 +68,16 @@ defmodule Rockbox.Pool.Manager do
 
   @doc "Pool snapshot used by the Autoscaler."
   def snapshot, do: :ets.tab2list(@table)
+
+  @doc """
+  Boot `count` idle engines for bucket `key` ahead of demand (Autoscaler
+  pre-warm to the recent concurrent peak). RL buckets also hand the new
+  engine the last released episode's settings so it pre-boots warm workers
+  — a pre-warmed engine's first create then claims warm (~5 ms) instead of
+  paying engine boot + cold worker launch (~15 ms).
+  """
+  def prewarm(key, count) when is_integer(count) and count > 0,
+    do: GenServer.cast(__MODULE__, {:prewarm, key, count})
 
   @doc """
   Retire up to `count` idle VMs from the pool bucket keyed by `key`.
@@ -143,8 +153,42 @@ defmodule Rockbox.Pool.Manager do
     end
   end
 
+  def handle_cast({:prewarm, {w, l, r, m, sid} = key, count}, state) do
+    template = Map.get(state, {:template, key})
+
+    for _ <- 1..count do
+      vm_id = "vm_" <> Integer.to_string(System.unique_integer([:positive, :monotonic]), 36)
+
+      case Rockbox.VM.Supervisor.start_vm(%{
+             vm_id: vm_id,
+             workspace_id: w,
+             language: l,
+             mode: m,
+             session_id: sid,
+             runtime: r
+           }) do
+        {:ok, _pid} ->
+          now = System.system_time(:millisecond)
+          :ets.insert(@table, {vm_id, %{key: key, state: :idle, ts: now}})
+          :ets.insert(@idx_table, {key, vm_id, now})
+
+          if m in [:rl_step, :rl_episode] and match?(%Effective{}, template),
+            do: Rockbox.VM.Server.rl_prespawn(vm_id, template)
+
+        {:error, reason} ->
+          require Logger
+          Logger.warning("pool prewarm spawn failed key=#{inspect(key)}: #{inspect(reason)}")
+      end
+    end
+
+    {:noreply, state}
+  end
+
   @impl true
   def handle_cast({:release, vm_id, %Effective{} = s}, state) do
+    # Remember the bucket's latest shape so pre-warmed engines can prespawn.
+    state = Map.put(state, {:template, pool_key(s)}, s)
+
     case {s.mode, idle_ttl_ms(s)} do
       {:exec, 0} ->
         # One-shot (TTL disabled): destroy.
@@ -222,7 +266,7 @@ defmodule Rockbox.Pool.Manager do
   # Atomically claim one idle VM from the bucket `key`.
   #
   # SOTA Loop21: bucket-indexed take. `lookup(key)` on the bag index returns
-  # only this bucket's idle VMs (O(bucket), oldest first) instead of
+  # only this bucket's idle VMs (O(bucket), newest first) instead of
   # `match_object`-scanning the whole pool (O(pool)); each candidate is
   # claimed with atomic `:ets.take`, so concurrent acquirers race per-VM —
   # exactly one wins each VM and losers try the next candidate. No sentinel
@@ -241,8 +285,14 @@ defmodule Rockbox.Pool.Manager do
         :empty
 
       candidates ->
+        # Newest idle first (LIFO): the most recently released engine has
+        # warm RL workers and hot caches. Oldest-first rotated serial
+        # creates across every idle engine, so each landed on one that had
+        # never claimed a warm worker (profile: 42 creates, 1 claim, 10 ms
+        # cold boot each). The oldest idle engines age out via TTL and the
+        # autoscaler instead.
         candidates
-        |> Enum.sort_by(fn {_k, _vm, ts} -> ts end)
+        |> Enum.sort_by(fn {_k, _vm, ts} -> ts end, :desc)
         |> take_candidate(key, ttl_ms)
     end
   end
