@@ -13,7 +13,7 @@ defmodule Rockbox.Settings.Validator do
     language runtime files entrypoint
     mode session_id
     limits lifecycle capabilities network filesystem env secrets resolved_secrets stdin
-    determinism gpu output observability cost
+    determinism gpu output observability cost isolation
   )a
 
   @valid_languages ~w(python typescript go rust cpp)
@@ -43,12 +43,13 @@ defmodule Rockbox.Settings.Validator do
   defp maybe_atom(k)
        when k in ~w(schema request_id labels strict language runtime files entrypoint mode session_id
                                   limits lifecycle capabilities network filesystem env secrets resolved_secrets stdin
-                                  determinism gpu output observability cost) do
+                                  determinism gpu output observability cost isolation) do
     String.to_atom(k)
   end
 
   defp maybe_atom(k), do: k
 
+  defp normalise_value(:isolation, v) when is_binary(v), do: v
   defp normalise_value(:language, v) when is_binary(v), do: String.to_atom(v)
   defp normalise_value(:mode, v) when is_binary(v), do: String.to_atom(v)
 
@@ -96,6 +97,7 @@ defmodule Rockbox.Settings.Validator do
       |> require_field(s, :files, "files[] is required and non-empty")
       |> validate_language(s)
       |> validate_mode(s)
+      |> validate_isolation(s)
       |> validate_files(s)
 
     if errs == [], do: {:ok, ensure_defaults(s)}, else: {:error, errs}
@@ -119,6 +121,18 @@ defmodule Rockbox.Settings.Validator do
   end
 
   defp validate_language(errs, _), do: errs
+
+  @valid_isolation ~w(sandbox microvm)
+
+  defp validate_isolation(errs, %{isolation: iso}) when not is_nil(iso) do
+    if to_string(iso) in @valid_isolation,
+      do: errs,
+      else: [
+        %{path: "isolation", reason: "must be one of #{Enum.join(@valid_isolation, ", ")}"} | errs
+      ]
+  end
+
+  defp validate_isolation(errs, _), do: errs
 
   defp validate_mode(errs, %{mode: mode}) when is_atom(mode) do
     if Atom.to_string(mode) in @valid_modes do

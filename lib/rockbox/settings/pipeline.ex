@@ -117,7 +117,8 @@ defmodule Rockbox.Settings.Pipeline do
       cost: stringify_keys(s[:cost] || %{}),
       labels: stringify_kv(s[:labels] || %{}),
       clamped: Enum.reverse(clamp_log),
-      strict: s[:strict] || false
+      strict: s[:strict] || false,
+      isolation: to_string(s[:isolation] || "sandbox")
     }
 
     # SOTA Loop22: freeze the content hash once. The exec path (ExecCache
