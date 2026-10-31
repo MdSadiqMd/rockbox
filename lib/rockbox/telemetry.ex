@@ -1,7 +1,7 @@
 defmodule Rockbox.Telemetry do
   @moduledoc """
-  Telemetry supervisor + metrics catalog. The Prometheus exporter is wired up
-  in [`RockboxWeb.Endpoint`] under `/metrics`
+  Telemetry supervisor + metrics catalog, scraped at `GET /metrics`
+  (`RockboxWeb.AdminController.metrics/2`, admin token).
   """
 
   use Supervisor
@@ -43,6 +43,14 @@ defmodule Rockbox.Telemetry do
       ),
       counter("rockbox.exec.output_capped.count"),
       counter("rockbox.exec.cost_exceeded.count"),
+
+      # RL
+      sum("rockbox.rl.steps.total", event_name: [:rockbox, :rl, :steps], measurement: :count),
+      counter("rockbox.rl.episode.count", tags: [:event]),
+
+      # Caches
+      counter("rockbox.cache.hit.count", tags: [:cache]),
+      counter("rockbox.cache.miss.count", tags: [:cache]),
 
       # Webhook
       counter("rockbox.webhook.sent.count", tags: [:event]),

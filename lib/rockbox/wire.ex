@@ -75,6 +75,10 @@ defmodule Rockbox.Wire do
   def rl_snapshot(id, episode_id),
     do: %{"cmd" => "rl_snapshot", "id" => id, "episode_id" => episode_id}
 
+  @doc "Pre-boot warm RL workers for `eff`'s sandbox shape (pool pre-warm)."
+  def rl_prespawn(%Rockbox.Settings.Effective{} = eff),
+    do: Map.merge(%{"cmd" => "rl_prespawn"}, Rockbox.Settings.Effective.to_wire(eff))
+
   @doc "End an episode's worker but keep the engine alive for the next one."
   def rl_close(id, episode_id),
     do: %{"cmd" => "rl_close", "id" => id, "episode_id" => episode_id}
