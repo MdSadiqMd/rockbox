@@ -103,6 +103,14 @@ defmodule Rockbox.VM.Server do
     )
   end
 
+  @doc "Fire-and-forget: ask a fresh engine to pre-boot warm workers for `eff`'s shape."
+  def rl_prespawn(vm_id, %Effective{} = eff) do
+    case VM.Registry.whereis(vm_id) do
+      {:ok, pid} -> GenServer.cast(pid, {:rl_prespawn, eff})
+      :error -> {:error, :not_found}
+    end
+  end
+
   @doc """
   Force the episode worker to write its checkpoint now and block for the
   ack. The engine replies with an `rl_step` frame, so it parks on the same
@@ -275,6 +283,11 @@ defmodule Rockbox.VM.Server do
   @impl true
   def handle_cast({:stdin, data}, state) do
     Port.command(state.port, Msgpax.pack!(Wire.stdin(data), iodata: true))
+    {:noreply, state}
+  end
+
+  def handle_cast({:rl_prespawn, %Effective{} = eff}, state) do
+    Port.command(state.port, Msgpax.pack!(Rockbox.Wire.rl_prespawn(eff), iodata: true))
     {:noreply, state}
   end
 
