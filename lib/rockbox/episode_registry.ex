@@ -58,8 +58,26 @@ defmodule Rockbox.EpisodeRegistry do
   `%Effective{}` the episode was started with; teardown hands it to
   `Pool.release/2` so the engine goes back to the right pool bucket.
   """
-  def register(episode_id, vm_id, workspace_id, tier \\ :pro, settings \\ nil),
-    do: GenServer.call(__MODULE__, {:register, episode_id, vm_id, workspace_id, tier, settings})
+  def register(episode_id, vm_id, workspace_id, tier \\ :pro, settings \\ nil) do
+    now = System.system_time(:millisecond)
+
+    route = %Route{
+      episode_id: episode_id,
+      vm_id: vm_id,
+      workspace_id: workspace_id,
+      tier: tier,
+      settings: settings,
+      created_at: now,
+      last_seen: now
+    }
+
+    # The route is live the moment the ETS row lands; only the DETS copy
+    # (crash-recovery) goes through the server. The old synchronous call
+    # carried the full settings struct and a DETS write on the create path
+    # (~1.5 ms of a 7 ms create).
+    true = :ets.insert(@table, {episode_id, route})
+    GenServer.cast(__MODULE__, {:persist, episode_id, route})
+  end
 
   @doc "The frozen settings recorded at register time, or nil for legacy routes."
   def lookup_settings(episode_id) do
@@ -70,7 +88,10 @@ defmodule Rockbox.EpisodeRegistry do
   end
 
   @doc "Forget the mapping (called on episode destroy / engine death)."
-  def forget(episode_id), do: GenServer.call(__MODULE__, {:forget, episode_id})
+  def forget(episode_id) do
+    :ets.delete(@table, episode_id)
+    GenServer.cast(__MODULE__, {:unpersist, episode_id})
+  end
 
   @doc """
   Claim exclusive restore rights for `eid`. `:ok` means the caller must
@@ -120,30 +141,17 @@ defmodule Rockbox.EpisodeRegistry do
   end
 
   @impl true
-  def handle_call({:register, eid, vm_id, wid, tier, settings}, _from, state) do
-    now = System.system_time(:millisecond)
-
-    route = %Route{
-      episode_id: eid,
-      vm_id: vm_id,
-      workspace_id: wid,
-      tier: tier,
-      settings: settings,
-      created_at: now,
-      last_seen: now
-    }
-
-    :ets.insert(@table, {eid, route})
+  def handle_cast({:persist, eid, route}, state) do
     persist(state.dets, eid, route)
-    {:reply, :ok, state}
+    {:noreply, state}
   end
 
-  def handle_call({:forget, eid}, _from, state) do
-    :ets.delete(@table, eid)
+  def handle_cast({:unpersist, eid}, state) do
     unpersist(state.dets, eid)
-    {:reply, :ok, state}
+    {:noreply, state}
   end
 
+  @impl true
   def handle_call({:claim_restore, eid, ttl_ms}, {from, _}, %{restoring: r, claims: c} = state) do
     cond do
       MapSet.member?(r, eid) ->
